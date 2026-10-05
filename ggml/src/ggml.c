@@ -698,6 +698,15 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_q2_0,
         .from_float_ref           = (ggml_from_float_t) quantize_row_q2_0_ref,
     },
+    // K9 is a loader-only sentinel type: the tensor payload is one variable-length
+    // compressed stream (blck_size 1 / type_size 1 keep ggml_nbytes() = ne[0]).
+    // No ops are provided; llama-model-loader decodes it into a regular type.
+    [GGML_TYPE_K9] = {
+        .type_name                = "k9",
+        .blck_size                = 1,
+        .type_size                = 1,
+        .is_quantized             = false,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,

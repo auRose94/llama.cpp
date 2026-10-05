@@ -19,6 +19,37 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
+// K9 (fork): parse the "k9.directory" KV (added by base9-quantization's
+// exporter) plus the optional "k9.materialize" destination override.
+void llama_model_loader::k9_load_meta() {
+    const int kid = gguf_find_key(metadata, "k9.directory");
+    if (kid == -1) {
+        return;
+    }
+    if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_ARRAY) {
+        throw std::runtime_error(format("k9.directory must be an array (got %s)", gguf_type_name(gguf_get_kv_type(metadata, kid))));
+    }
+    const int64_t n = gguf_get_arr_n(metadata, kid);
+    const uint8_t * data = (const uint8_t *) gguf_get_arr_data(metadata, kid);
+    std::string err;
+    if (!k9_parse_directory(data, n, k9_meta, err)) {
+        throw std::runtime_error(format("failed to parse k9.directory: %s", err.c_str()));
+    }
+    const int kid_dst = gguf_find_key(metadata, "k9.materialize");
+    if (kid_dst != -1) {
+        const std::string t = gguf_get_val_str(metadata, kid_dst);
+        if (t == "q8_0") {
+            k9_dst_type = GGML_TYPE_Q8_0;
+        } else if (t == "f16") {
+            k9_dst_type = GGML_TYPE_F16;
+        } else {
+            throw std::runtime_error(format("unsupported k9.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+        }
+    }
+    LLAMA_LOG_INFO("llama_model_loader: K9 model with %zu stream tensors (materialize: %s)\n",
+            k9_meta.size(), k9_dst_type == GGML_TYPE_Q8_0 ? "q8_0" : "f16");
+}
+
 const char * llama_file_version_name(llama_fver version) {
     switch (version) {
         case GGUF_FILE_VERSION_V1: return "GGUF V1 (support until nov 2023)";
@@ -579,6 +610,8 @@ llama_model_loader::llama_model_loader(
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
+        k9_load_meta();
+
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
         contexts.emplace_back(ctx);
 
@@ -697,6 +730,8 @@ llama_model_loader::llama_model_loader(
 
         get_key(llm_kv(LLM_KV_GENERAL_ARCHITECTURE), arch_name, false);
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
+
+        k9_load_meta();
 
         files.emplace_back(new llama_file(file));
         contexts.emplace_back(ctx);
@@ -1308,6 +1343,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
         }
+        if (type == GGML_TYPE_K9) {
+            type = k9_dst_type; // virtual/meta-device sizing for K9 stream tensors
+        }
 
         // for tensors that are not required some of the dimensions can be invalid:
         if (flags & TENSOR_NOT_REQUIRED) {
@@ -1344,6 +1382,72 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     LLAMA_LOG_DEBUG("%s: loading tensor %s\n", __func__, tn.str().c_str());
+
+    // K9 (fork): the GGUF payload is a compressed stream whose blob length is
+    // baked into the GGUF tensor's ne[0]; the real shape/type come from the
+    // caller and from k9.directory. Materialize as Q8_0 (exact for odd-grid
+    // digits) or F16 (required when the tensor carries an act-order perm).
+    {
+        const struct ggml_tensor * k9_g = get_tensor_meta(tn.str().c_str());
+        if (k9_g != nullptr && k9_g->type == GGML_TYPE_K9) {
+            if (ne.size() != 2) {
+                GGML_ABORT("K9 tensor %s must be 2D", tn.str().c_str());
+            }
+            const auto it = k9_meta.find(tn.str());
+            if (it == k9_meta.end()) {
+                throw std::runtime_error(format("k9.directory has no record for tensor %s", tn.str().c_str()));
+            }
+            const k9_tensor_meta & meta = it->second;
+            const ggml_type dst = (meta.perm_flag != 0) ? GGML_TYPE_F16 : k9_dst_type;
+
+            ggml_tensor t_meta;
+            memset(&t_meta, 0, sizeof(ggml_tensor));
+            t_meta.type = dst;
+            t_meta.ne[0] = ne.begin()[0];
+            t_meta.ne[1] = ne.begin()[1];
+            t_meta.ne[2] = 1;
+            t_meta.ne[3] = 1;
+            t_meta.nb[0] = ggml_type_size(dst);
+            t_meta.nb[1] = ggml_row_size(dst, t_meta.ne[0]);
+            t_meta.nb[2] = ggml_row_size(dst, t_meta.ne[0]) * t_meta.ne[1];
+            t_meta.nb[3] = ggml_row_size(dst, t_meta.ne[0]) * t_meta.ne[1];
+            ggml_set_name(&t_meta, tn.str().c_str());
+
+            if ((uint32_t) ne.begin()[0] != meta.shape[1] || (uint32_t) ne.begin()[1] != meta.shape[0]) {
+                throw std::runtime_error(format("k9: tensor %s shape (ne0=%d, ne1=%d) does not match the k9.directory stored shape (%d, %d)",
+                    tn.str().c_str(), (int) ne.begin()[0], (int) ne.begin()[1], (int) meta.shape[0], (int) meta.shape[1]));
+            }
+            if ((int64_t) meta.group * (ne.begin()[0] / meta.group) != ne.begin()[0]) {
+                throw std::runtime_error(format("k9: tensor %s columns (%d) not divisible by group %d",
+                    tn.str().c_str(), (int) ne.begin()[0], (int) meta.group));
+            }
+
+            // buffer selection runs on the materialized shape so GPU offload
+            // and CPU-layer logic behave exactly like the destination type
+            ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
+            if (buft == nullptr) {
+                return nullptr;
+            }
+            ggml_context * ctx = ctx_for_buft(buft);
+
+            if (flags & TENSOR_DUPLICATED) {
+                ggml_tensor * t = ggml_get_tensor(ctx, tn.str().c_str());
+                if (t) {
+                    return t;
+                }
+            }
+
+            struct ggml_tensor * tensor = ggml_dup_tensor(ctx, &t_meta);
+            ggml_set_name(tensor, ggml_get_name(&t_meta));
+            if (flags & TENSOR_DUPLICATED) {
+                size_data += ggml_nbytes(&t_meta);
+            } else {
+                n_created++;
+            }
+            return tensor;
+        }
+    }
+
     const struct ggml_tensor * cur = check_tensor_dims(tn.str(), ne, !(flags & TENSOR_NOT_REQUIRED), flags & TENSOR_ALLOW_RESHAPE);
     if (cur == NULL) {
         return NULL;
@@ -1690,6 +1794,21 @@ bool llama_model_loader::load_all_data(
         });
     }
 
+    // K9 (fork): destination tensors of K9 stream tensors need writable host
+    // storage (they must not alias the mmap of the GGUF); gather their total
+    // size and allocate one CPU buffer lazily on first use.
+    size_t k9_total = 0;
+    if (!k9_meta.empty()) {
+        for (ggml_tensor * t : tensors) {
+            const auto * w = get_weight(ggml_get_name(t));
+            if (w && w->tensor->type == GGML_TYPE_K9) {
+                k9_total += ggml_nbytes(t);
+            }
+        }
+    }
+    ggml_backend_buffer_t k9_buf = nullptr;
+    size_t k9_used = 0;
+
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
         if (weight == nullptr) {
@@ -1704,6 +1823,49 @@ bool llama_model_loader::load_all_data(
         }
 
         size_t n_size = ggml_nbytes(cur);
+
+        if (weight->tensor->type == GGML_TYPE_K9) {
+            const auto it = k9_meta.find(ggml_get_name(cur));
+            if (it == k9_meta.end()) {
+                throw std::runtime_error(format("k9.directory has no record for tensor %s", ggml_get_name(cur)));
+            }
+            const size_t blob_len = ggml_nbytes(weight->tensor);
+            const uint8_t * blob = nullptr;
+            std::vector<uint8_t> file_blob;
+            if (use_mmap || lazy.has(cur)) {
+                const auto & mapping = mappings.at(weight->idx);
+                blob = (const uint8_t *) mapping->addr() + weight->offs;
+                if (lmlocks && !lazy.has(cur)) {
+                    lmlocks->at(weight->idx)->grow_to(weight->offs + blob_len);
+                }
+                auto & mmap_used = mmaps_used[weight->idx];
+                mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                mmap_used.second = std::max(mmap_used.second, weight->offs + blob_len);
+            } else {
+                auto & file = files.at(weight->idx);
+                file->seek(weight->offs, SEEK_SET);
+                file_blob.resize(blob_len);
+                file->read_raw(file_blob.data(), blob_len);
+                blob = file_blob.data();
+            }
+            std::vector<uint8_t> decoded(n_size);
+            std::string err;
+            if (!k9_dequantize(blob, blob_len, it->second, cur->ne, cur->type, decoded.data(), err)) {
+                throw std::runtime_error(format("failed to decode K9 tensor %s: %s", ggml_get_name(cur), err.c_str()));
+            }
+            if (cur->data == nullptr) {
+                if (k9_buf == nullptr) {
+                    k9_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), k9_total);
+                    ggml_backend_buffer_set_usage(k9_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                }
+                ggml_backend_tensor_alloc(k9_buf, cur,
+                        (uint8_t *) ggml_backend_buffer_get_base(k9_buf) + k9_used);
+                k9_used += n_size;
+            }
+            ggml_backend_tensor_set(cur, decoded.data(), 0, n_size);
+            size_done += n_size;
+            continue;
+        }
 
         const bool from_mapping = use_mmap || lazy.has(cur);
 

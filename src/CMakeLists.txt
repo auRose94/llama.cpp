@@ -19,6 +19,7 @@ set(LLAMA_CORE_SOURCES
     llama-grammar.cpp
     llama-graph.cpp
     llama-hparams.cpp
+    k9.cpp
     llama-impl.cpp
     llama-io.cpp
     llama-kv-cache.cpp
