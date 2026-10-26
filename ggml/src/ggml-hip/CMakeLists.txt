@@ -131,6 +131,10 @@ if (CXX_IS_HIPCC)
     target_link_libraries(ggml-hip PRIVATE hip::device)
 else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
+    # ROCm >=7: clang++ no longer defaults .cu offload to the HIP frontend, so
+    # an explicit -x hip is required — but only for COMPILING, never linking
+    # (it would make the linker try to recompile the .o inputs as source).
+    set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES COMPILE_FLAGS "-x hip")
 endif()
 
 if (GGML_STATIC)

@@ -30,6 +30,18 @@ void quantize_row_q2_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_q2_0_ref(x, y, k);
 }
 
+void quantize_row_k9_4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_k9_4_ref(x, y, k);
+}
+
+void quantize_row_k9_6(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_k9_6_ref(x, y, k);
+}
+
+void quantize_row_k9_7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_k9_7_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -217,6 +229,153 @@ void ggml_vec_dot_q2_0_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
         }
 
         sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+// ============================== K9 (ninths) ===============================
+// w = s * code with one fp16 scale per 64-group (4 of them per 256-code
+// superblock) and Q8_0 activations (two 32-code blocks per group). Layout is
+// sequential byte order (low nibble first), NOT the k-quant SIMD interleave.
+// Σ aᵢ·wᵢ = s · d1 · Σ qᵢ·codeᵢ per 32-code block; partials are exact ints.
+
+void ggml_vec_dot_k9_4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK9_SUPER;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_k9_4 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_k9_4 * GGML_RESTRICT xb = &x[i];
+
+        for (int g = 0; g < 4; g++) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(xb->ds[g]);
+            const uint8_t * GGML_RESTRICT qs = xb->qs + g*32;
+
+            float sumi = 0.0f;
+
+            for (int k = 0; k < 2; k++) {
+                const block_q8_0 * GGML_RESTRICT yb = &y[i*8 + g*2 + k];
+                const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+                const int8_t * GGML_RESTRICT qy = yb->qs;
+
+                int sumi_block = 0;
+                for (int b = 0; b < 16; ++b) {
+                    const uint8_t byte = qs[16*k + b];
+                    sumi_block += ((int)(byte & 0x0F) - 8) * qy[2*b    ]
+                               +  ((int)(byte >>   4) - 8) * qy[2*b + 1];
+                }
+                sumi += d1 * sumi_block;
+            }
+
+            sumf += d0 * sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_k9_6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK9_SUPER;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_k9_6 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_k9_6 * GGML_RESTRICT xb = &x[i];
+
+        for (int g = 0; g < 4; g++) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(xb->ds[g]);
+            const uint8_t * GGML_RESTRICT qs = xb->qs + g*32;
+            const uint8_t * GGML_RESTRICT hh = xb->hh + g*16;
+
+            float sumi = 0.0f;
+
+            for (int k = 0; k < 2; k++) {
+                const block_q8_0 * GGML_RESTRICT yb = &y[i*8 + g*2 + k];
+                const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+                const int8_t * GGML_RESTRICT qy = yb->qs;
+
+                int sumi_block = 0;
+                for (int b = 0; b < 16; ++b) {
+                    const int c0 = 32*k + 2*b;
+                    const int c1 = c0 + 1;
+                    const uint8_t lb = qs[16*k + b];
+                    const int h0 = (hh[c0 >> 2] >> ((c0 & 3) * 2)) & 0x03;
+                    const int h1 = (hh[c1 >> 2] >> ((c1 & 3) * 2)) & 0x03;
+                    sumi_block += ((int)((lb & 0x0F) | (h0 << 4)) - 32) * qy[2*b    ]
+                               +  ((int)((lb >> 4)    | (h1 << 4)) - 32) * qy[2*b + 1];
+                }
+                sumi += d1 * sumi_block;
+            }
+
+            sumf += d0 * sumi;
+        }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_k9_7_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK9_SUPER;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_k9_7 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_k9_7 * GGML_RESTRICT xb = &x[i];
+
+        for (int g = 0; g < 4; g++) {
+            const float d0 = GGML_CPU_FP16_TO_FP32(xb->ds[g]);
+            const int8_t * GGML_RESTRICT csp = xb->qs + g*64;
+
+            float sumi = 0.0f;
+
+            for (int k = 0; k < 2; k++) {
+                const block_q8_0 * GGML_RESTRICT yb = &y[i*8 + g*2 + k];
+                const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+                const int8_t * GGML_RESTRICT qy = yb->qs;
+
+                int sumi_block = 0;
+                for (int b = 0; b < 32; ++b) {
+                    sumi_block += (int) csp[32*k + b] * qy[b];
+                }
+                sumi += d1 * sumi_block;
+            }
+
+            sumf += d0 * sumi;
+        }
     }
 
     *s = sumf;

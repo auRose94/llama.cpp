@@ -431,7 +431,10 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_K9      = 43, // K9 (ninths-grid) rANS stream, loader-only sentinel
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_K9_4    = 44, // K9_4 (ninths, stage 2): 256-code resident superblocks,
+        GGML_TYPE_K9_6    = 45, //   4x fp16 scales per 64-group, pre-biased codes
+        GGML_TYPE_K9_7    = 46, //   (bit-width containers, k <= 15/63/99 — docs/08)
+        GGML_TYPE_COUNT   = 47,
     };
 
     // [TAG_GGML_PREC]
@@ -487,6 +490,9 @@ extern "C" {
         GGML_FTYPE_MOSTLY_NVFP4   = 26, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q1_0    = 27, // except 1d tensors
         GGML_FTYPE_MOSTLY_Q2_0    = 28, // except 1d tensors
+        GGML_FTYPE_MOSTLY_K9_4    = 29, // ninths resident containers (stage 2)
+        GGML_FTYPE_MOSTLY_K9_6    = 30,
+        GGML_FTYPE_MOSTLY_K9_7    = 31,
     };
 
     // available tensor operations:

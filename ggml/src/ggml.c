@@ -707,6 +707,33 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 1,
         .is_quantized             = false,
     },
+    // K9_4/K9_6/K9_7 (ninths, stage 2): 256-code resident superblocks, 4x fp16
+    // scales per 64-group, codes pre-biased (d - H) at export so w = s*code is
+    // exact; the k lives only in the exporter (bit-width containers).
+    [GGML_TYPE_K9_4] = {
+        .type_name                = "k9_4",
+        .blck_size                = QK9_SUPER,
+        .type_size                = sizeof(block_k9_4),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_k9_4,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_k9_4_ref,
+    },
+    [GGML_TYPE_K9_6] = {
+        .type_name                = "k9_6",
+        .blck_size                = QK9_SUPER,
+        .type_size                = sizeof(block_k9_6),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_k9_6,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_k9_6_ref,
+    },
+    [GGML_TYPE_K9_7] = {
+        .type_name                = "k9_7",
+        .blck_size                = QK9_SUPER,
+        .type_size                = sizeof(block_k9_7),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_k9_7,
+        .from_float_ref           = (ggml_from_float_t) quantize_row_k9_7_ref,
+    },
     [GGML_TYPE_Q4_0] = {
         .type_name                = "q4_0",
         .blck_size                = QK4_0,
@@ -1454,6 +1481,9 @@ enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype) {
         case GGML_FTYPE_MOSTLY_Q4_1:          wtype = GGML_TYPE_Q4_1;  break;
         case GGML_FTYPE_MOSTLY_Q1_0:          wtype = GGML_TYPE_Q1_0;  break;
         case GGML_FTYPE_MOSTLY_Q2_0:          wtype = GGML_TYPE_Q2_0;  break;
+        case GGML_FTYPE_MOSTLY_K9_4:          wtype = GGML_TYPE_K9_4;  break;
+        case GGML_FTYPE_MOSTLY_K9_6:          wtype = GGML_TYPE_K9_6;  break;
+        case GGML_FTYPE_MOSTLY_K9_7:          wtype = GGML_TYPE_K9_7;  break;
         case GGML_FTYPE_MOSTLY_Q5_0:          wtype = GGML_TYPE_Q5_0;  break;
         case GGML_FTYPE_MOSTLY_Q5_1:          wtype = GGML_TYPE_Q5_1;  break;
         case GGML_FTYPE_MOSTLY_Q8_0:          wtype = GGML_TYPE_Q8_0;  break;
@@ -8186,6 +8216,9 @@ size_t ggml_quantize_chunk(
     switch (type) {
         case GGML_TYPE_Q1_0:    result = quantize_q1_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q2_0:    result = quantize_q2_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_K9_4:    result = quantize_k9_4   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_K9_6:    result = quantize_k9_6   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
+        case GGML_TYPE_K9_7:    result = quantize_k9_7   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_0:    result = quantize_q4_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q4_1:    result = quantize_q4_1   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;
         case GGML_TYPE_Q5_0:    result = quantize_q5_0   (src + start, (char *) dst + start_row * row_size, nrows, n_per_row, imatrix); break;

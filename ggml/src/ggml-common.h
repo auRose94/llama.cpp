@@ -191,6 +191,34 @@ typedef struct {
 } block_q2_0;
 static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
 
+// K9_4/K9_6/K9_7 (ninths, stage 2 resident containers): 256-code superblock
+// holding 4 x 64-groups, one fp16 scale per group. Codes are pre-biased at
+// export (code = d - H, H = (k-1)//2), so w = s * code is exact in fp32 and
+// the type carries no k: K9_4/K9_6/K9_7 are bit-width containers (k <= 15/63/99).
+// Layout is sequential (first code in the low nibble), NOT the k-quant SIMD
+// interleave — see base9-quantization docs/08.
+#define QK9_SUPER 256
+#define QK9_GROUP 64
+
+typedef struct {
+    ggml_half ds[4];     // scale per 64-group
+    uint8_t  qs[128];    // nibble pairs; byte b: code (2b) low = (nibble - 8), code (2b+1) high
+} block_k9_4;
+static_assert(sizeof(block_k9_4) == 4*sizeof(ggml_half) + 128, "wrong k9_4 block size/padding");
+
+typedef struct {
+    ggml_half ds[4];     // scale per 64-group
+    uint8_t  qs[128];    // low nibble of u6 = code + 32, two codes per byte
+    uint8_t  hh[64];     // high 2 bits of u6; byte b: codes (4b..4b+3) in bit pairs 0-1..6-7
+} block_k9_6;
+static_assert(sizeof(block_k9_6) == 4*sizeof(ggml_half) + 192, "wrong k9_6 block size/padding");
+
+typedef struct {
+    ggml_half ds[4];     // scale per 64-group
+    int8_t   qs[256];    // signed code = d - H, |code| <= 49 for k99
+} block_k9_7;
+static_assert(sizeof(block_k9_7) == 4*sizeof(ggml_half) + 256, "wrong k9_7 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
