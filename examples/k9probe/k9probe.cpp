@@ -43,15 +43,28 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const int kid = gguf_find_key(meta, "k9.directory");
+    // ninths.directory2 (v2) primary, then ninths.directory (k9.directory =
+    // legacy alias — see llama-model-loader.cpp)
+    int kid = gguf_find_key(meta, "ninths.directory2");
+    const bool k9_v2 = kid != -1;
     if (kid == -1) {
-        fprintf(stderr, "no k9.directory KV in %s\n", fname.c_str());
+        kid = gguf_find_key(meta, "ninths.directory");
+    }
+    if (kid == -1) {
+        kid = gguf_find_key(meta, "k9.directory");
+    }
+    if (kid == -1) {
+        fprintf(stderr, "no ninths.directory[2]/k9.directory KV in %s\n", fname.c_str());
         return 1;
     }
     std::map<std::string, k9_tensor_meta> k9_meta;
     std::string err;
-    if (!k9_parse_directory((const uint8_t *) gguf_get_arr_data(meta, kid),
-                            gguf_get_arr_n(meta, kid), k9_meta, err)) {
+    const bool parsed = k9_v2
+        ? k9_parse_directory2((const uint8_t *) gguf_get_arr_data(meta, kid),
+                              gguf_get_arr_n(meta, kid), k9_meta, err)
+        : k9_parse_directory((const uint8_t *) gguf_get_arr_data(meta, kid),
+                             gguf_get_arr_n(meta, kid), k9_meta, err);
+    if (!parsed) {
         fprintf(stderr, "k9_parse_directory failed: %s\n", err.c_str());
         return 1;
     }

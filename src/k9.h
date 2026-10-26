@@ -45,6 +45,7 @@ struct k9_tensor_meta {
     uint32_t group      = 0; // scale group along the stored column axis (64)
     uint32_t scale_mode = 0; // 0 fp32, 1 fp16, 4 ent8
     uint32_t perm_flag  = 0;
+    uint8_t  lanes      = 1; // v2: 1 = single-lane (v1 layout), >1 = lane-interleaved
     uint32_t tbl        = 0; // freq table bytes
     uint32_t dig        = 0; // digit rANS stream bytes
     uint32_t sca        = 0; // scales blob bytes
@@ -56,6 +57,11 @@ struct k9_tensor_meta {
 // malformed input.
 bool k9_parse_directory(const uint8_t * data, size_t n_bytes,
                         std::map<std::string, k9_tensor_meta> & out, std::string & err);
+
+// v2 (docs/11, lane-interleaved streams): leading u16 version == 2, then the
+// v1 record layout with one extra u8 lanes field per record.
+bool k9_parse_directory2(const uint8_t * data, size_t n_bytes,
+                         std::map<std::string, k9_tensor_meta> & out, std::string & err);
 
 // Decode one K9 blob into dequantized weights, writing ggml_nbytes-ordered raw
 // data for a 2-D materialized tensor of type dst_type with shape ne[2 dims].

@@ -6,10 +6,14 @@
 #include "k9.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 // ggml-impl.h is not on the llama include path: use the public fp16 API and a
@@ -168,12 +172,117 @@ bool k9_parse_directory(const uint8_t * data, size_t n_bytes,
     return true;
 }
 
+bool k9_parse_directory2(const uint8_t * data, size_t n_bytes,
+                         std::map<std::string, k9_tensor_meta> & out, std::string & err) {
+    size_t pos = 0;
+    if (n_bytes < 4) {
+        err = "k9.directory2 truncated (header)";
+        return false;
+    }
+    if (rd_u16(data) != 2) {
+        err = "k9.directory2: unsupported stream version";
+        return false;
+    }
+    const uint16_t n = rd_u16(data + pos + 2); pos += 4;
+    for (uint16_t i = 0; i < n; i++) {
+        if (n_bytes - pos < 2) {
+            err = "k9.directory2 truncated (name header)";
+            return false;
+        }
+        const uint16_t name_len = rd_u16(data + pos); pos += 2;
+        if (n_bytes - pos < name_len + 1 + 4*4) {
+            err = "k9.directory2 truncated (record body)";
+            return false;
+        }
+        k9_tensor_meta m;
+        m.name.assign((const char *) data + pos, name_len); pos += name_len;
+        const uint8_t rank = data[pos];
+        pos += 1;
+        if (rank != 2 || n_bytes - pos < 4*rank + 5 + 4*4) {
+            err = "k9.directory2: unsupported rank or truncated record";
+            return false;
+        }
+        m.shape[0] = rd_u32(data + pos);
+        m.shape[1] = rd_u32(data + pos + 4);
+        pos += 4 * rank;
+        m.k          = data[pos + 0];
+        m.group      = data[pos + 1];
+        m.scale_mode = data[pos + 2];
+        m.perm_flag  = data[pos + 3];
+        m.lanes      = data[pos + 4];
+        pos += 5;
+        if (m.group == 0 || m.k == 0 || m.k > 255 || m.lanes == 0 || m.lanes > 64) {
+            err = "k9.directory2: unsupported k/group/lanes for " + m.name;
+            return false;
+        }
+        m.tbl  = rd_u32(data + pos + 0);
+        m.dig  = rd_u32(data + pos + 4);
+        m.sca  = rd_u32(data + pos + 8);
+        m.plen = rd_u32(data + pos + 12);
+        pos   += 16;
+        out[m.name] = std::move(m);
+    }
+    if (pos != n_bytes) {
+        err = "k9.directory2 trailing bytes";
+        return false;
+    }
+    return true;
+}
+
 bool k9_decode_digits(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
                       size_t n, uint8_t * out, std::string & err) {
     try {
         if (blob_len != (size_t) meta.tbl + meta.dig + meta.sca + meta.plen) {
             err = "k9 blob length mismatch for " + meta.name;
             return false;
+        }
+        if (meta.lanes > 1) {
+            // v2 lane-interleaved stream (docs/11): u32 lane_off[L+1] then L
+            // single-lane sub-streams, each row-aligned over the shared table.
+            const uint64_t r = meta.shape[0], ccols = meta.shape[1];
+            if (n != r * ccols) {
+                err = "k9 v2 digit count mismatch for " + meta.name;
+                return false;
+            }
+            const size_t otab = 4ull * (meta.lanes + 1);
+            if (meta.dig < otab) {
+                err = "k9 v2 digit area truncated for " + meta.name;
+                return false;
+            }
+            const uint32_t * ot = (const uint32_t *) (blob + meta.tbl);
+            for (uint32_t i = 0; i < (uint32_t) meta.lanes; i++) {
+                if (ot[i] > ot[i + 1]) {
+                    err = "k9 v2 lane offsets not ascending for " + meta.name;
+                    return false;
+                }
+            }
+            if (ot[meta.lanes] != (uint32_t) (meta.dig - otab)) {
+                err = "k9 v2 lane offset tail mismatch for " + meta.name;
+                return false;
+            }
+            rans_tables t;
+            t.build(blob, meta.k);
+            const uint8_t * sub = blob + meta.tbl + otab;
+            const uint64_t rows_per = (r + meta.lanes - 1) / meta.lanes;
+            for (uint32_t li = 0; li < (uint32_t) meta.lanes; li++) {
+                const uint64_t a = std::min<uint64_t>(r, (uint64_t) li * rows_per);
+                const uint64_t b = std::min<uint64_t>(r, (uint64_t)(li + 1) * rows_per);
+                if (a >= b) {
+                    break;
+                }
+                k9_rans_decoder dec;
+                dec.init(sub + ot[li], ot[li + 1] - ot[li],
+                         t.freq.data(), t.cumul.data(), t.inv.data());
+                constexpr size_t CHUNK = 1 << 16;
+                const size_t n_lane = (size_t)(b - a) * (size_t) ccols;
+                size_t done = 0;
+                while (done < n_lane) {
+                    const size_t take = std::min(CHUNK, n_lane - done);
+                    dec.decode(out + (size_t) a * ccols + done, take);
+                    done += take;
+                }
+            }
+            return true;
         }
         rans_tables t;
         t.build(blob, meta.k); // freq table lives at blob[0..tbl], k u16 entries
@@ -321,10 +430,7 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
         }
 
         const size_t n_blocks_per_row = (size_t) (c / 32);
-        std::vector<uint8_t> row_digits(c);
-
-        for (int64_t i1 = 0; i1 < r; i1++) {
-            ddec.decode(row_digits.data(), c); // one stored row at a time
+        auto pack_row = [&](const uint8_t * row_digits, int64_t i1) {
             if (dst_type == GGML_TYPE_F16) {
                 ggml_fp16_t * dst = (ggml_fp16_t *) dest + i1 * c;
                 if (meta.perm_flag) {
@@ -360,6 +466,107 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
                         b1->qs[t] = (int8_t) row_digits[j * meta.group + meta.group / 2 + t] - (int8_t) H;
                     }
                 }
+            }
+        };
+
+        unsigned hw = std::thread::hardware_concurrency();
+        if (const char * envp = std::getenv("K9_DECODE_THREADS")) {
+            hw = (unsigned) std::max(1, atoi(envp));
+        } else if (hw == 0) {
+            hw = 1;
+        }
+
+        if (meta.lanes > 1) {
+            // v2 (docs/11): L independent rANS lanes over row-aligned chunks.
+            // Each worker decodes its own sub-stream (one lane == one state,
+            // all lanes share the frequency table) and packs its rows — no
+            // cross-lane synchronization, output bit-identical to v1.
+            const size_t otab = 4ull * (meta.lanes + 1);
+            if (meta.dig < otab) {
+                throw std::runtime_error("k9 v2 digit area truncated for " + meta.name);
+            }
+            const uint32_t * ot = (const uint32_t *) (blob + meta.tbl);
+            for (uint32_t i = 0; i < (uint32_t) meta.lanes; i++) {
+                if (ot[i] > ot[i + 1]) {
+                    throw std::runtime_error("k9 v2 lane offsets not ascending for " + meta.name);
+                }
+            }
+            if (ot[meta.lanes] != (uint32_t) (meta.dig - otab)) {
+                throw std::runtime_error("k9 v2 lane offset tail mismatch for " + meta.name);
+            }
+            const uint8_t * sub = blob + meta.tbl + otab;
+            const int64_t rows_per = ((int64_t) r + (int64_t) meta.lanes - 1) / (int64_t) meta.lanes;
+            const unsigned nthr = std::min<unsigned>(hw, (unsigned) meta.lanes);
+            std::atomic<uint32_t> next_lane{0};
+            auto lane_worker = [&]() {
+                for (;;) {
+                    const uint32_t li = next_lane.fetch_add(1);
+                    if (li >= (uint32_t) meta.lanes) {
+                        break;
+                    }
+                    const int64_t a = std::min<int64_t>((int64_t) r, (int64_t) li * rows_per);
+                    const int64_t b = std::min<int64_t>((int64_t) r, (int64_t)(li + 1) * rows_per);
+                    if (a >= b) {
+                        continue;
+                    }
+                    std::vector<uint8_t> lane_digits((size_t)(b - a) * (size_t) c);
+                    k9_rans_decoder dl;
+                    dl.init(sub + ot[li], ot[li + 1] - ot[li],
+                            dt.freq.data(), dt.cumul.data(), dt.inv.data());
+                    constexpr size_t CH = 1 << 24;
+                    for (size_t done = 0; done < lane_digits.size(); ) {
+                        const size_t take = std::min<size_t>(CH, lane_digits.size() - done);
+                        dl.decode(lane_digits.data() + done, take);
+                        done += take;
+                    }
+                    for (int64_t i1 = a; i1 < b; i1++) {
+                        pack_row(lane_digits.data() + (i1 - (size_t) a) * (size_t) c, i1);
+                    }
+                }
+            };
+            std::vector<std::thread> pool;
+            for (unsigned t = 0; t < nthr; t++) {
+                pool.emplace_back(lane_worker);
+            }
+            for (auto & th : pool) {
+                th.join();
+            }
+            return true;
+        }
+
+        // v1: the digit stream is a single sequential (backward-renorm) rANS
+        // lane, so it cannot be split across threads without changing the
+        // on-disk format; decode it once (bit-identical to the original
+        // row-chunked calls) and pack rows in parallel.
+        std::vector<uint8_t> digits((size_t) r * c);
+        for (size_t done = 0; done < (size_t) r * c; ) {
+            const size_t take = std::min<uint64_t>((uint64_t) 1 << 24, (size_t) r * c - done);
+            ddec.decode(digits.data() + done, take);
+            done += take;
+        }
+
+        unsigned n_threads = hw;
+        if ((int64_t) n_threads > r / 2) {
+            n_threads = (unsigned) std::max<int64_t>(1, r / 2);
+        }
+        if (n_threads <= 1) {
+            for (int64_t i1 = 0; i1 < r; i1++) {
+                pack_row(digits.data() + i1 * c, i1);
+            }
+        } else {
+            const int64_t rows_per_thread = (r + (int64_t) n_threads - 1) / (int64_t) n_threads;
+            std::vector<std::thread> pool;
+            for (unsigned t = 0; t < n_threads; t++) {
+                pool.emplace_back([&, t] {
+                    const int64_t b = std::min<int64_t>((int64_t) t * rows_per_thread, r);
+                    const int64_t e = std::min<int64_t>(b + rows_per_thread, r);
+                    for (int64_t i1 = b; i1 < e; i1++) {
+                        pack_row(digits.data() + i1 * c, i1);
+                    }
+                });
+            }
+            for (auto & th : pool) {
+                th.join();
             }
         }
         return true;

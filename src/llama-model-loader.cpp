@@ -19,23 +19,39 @@ static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
 
-// K9 (fork): parse the "k9.directory" KV (added by base9-quantization's
-// exporter) plus the optional "k9.materialize" destination override.
+// K9 (fork): parse the directory KV for rANS stream tensors, emitted by the
+// ninths exporter as "ninths.directory"; "k9.directory" is the legacy alias
+// (k9 = secondary shorthand), accepted so pre-rename GGUFs keep loading.
+// Optional directory override: "ninths.materialize" / legacy "k9.materialize".
 void llama_model_loader::k9_load_meta() {
-    const int kid = gguf_find_key(metadata, "k9.directory");
+    // v2 (lane-interleaved streams, docs/11) lives under ninths.directory2;
+    // old readers never look for that key, so a v2 file fails loudly there
+    // instead of silently misdecoding.
+    int kid = gguf_find_key(metadata, "ninths.directory2");
+    const bool k9_v2 = kid != -1;
+    if (kid == -1) {
+        kid = gguf_find_key(metadata, "ninths.directory");
+    }
+    if (kid == -1) {
+        kid = gguf_find_key(metadata, "k9.directory");
+    }
     if (kid == -1) {
         return;
     }
     if (gguf_get_kv_type(metadata, kid) != GGUF_TYPE_ARRAY) {
-        throw std::runtime_error(format("k9.directory must be an array (got %s)", gguf_type_name(gguf_get_kv_type(metadata, kid))));
+        throw std::runtime_error(format("k9 directory KV must be an array (got %s)", gguf_type_name(gguf_get_kv_type(metadata, kid))));
     }
     const int64_t n = gguf_get_arr_n(metadata, kid);
     const uint8_t * data = (const uint8_t *) gguf_get_arr_data(metadata, kid);
     std::string err;
-    if (!k9_parse_directory(data, n, k9_meta, err)) {
+    if (k9_v2) {
+        if (!k9_parse_directory2(data, n, k9_meta, err)) {
+            throw std::runtime_error(format("failed to parse ninths.directory2: %s", err.c_str()));
+        }
+    } else if (!k9_parse_directory(data, n, k9_meta, err)) {
         throw std::runtime_error(format("failed to parse k9.directory: %s", err.c_str()));
     }
-    const int kid_dst = gguf_find_key(metadata, "k9.materialize");
+    int kid_dst = gguf_find_key(metadata, "ninths.materialize");
     if (kid_dst != -1) {
         const std::string t = gguf_get_val_str(metadata, kid_dst);
         if (t == "q8_0") {
@@ -43,10 +59,22 @@ void llama_model_loader::k9_load_meta() {
         } else if (t == "f16") {
             k9_dst_type = GGML_TYPE_F16;
         } else {
-            throw std::runtime_error(format("unsupported k9.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+            throw std::runtime_error(format("unsupported ninths.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+        }
+    } else {
+        kid_dst = gguf_find_key(metadata, "k9.materialize");
+        if (kid_dst != -1) {
+            const std::string t = gguf_get_val_str(metadata, kid_dst);
+            if (t == "q8_0") {
+                k9_dst_type = GGML_TYPE_Q8_0;
+            } else if (t == "f16") {
+                k9_dst_type = GGML_TYPE_F16;
+            } else {
+                throw std::runtime_error(format("unsupported k9.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+            }
         }
     }
-    LLAMA_LOG_INFO("llama_model_loader: K9 model with %zu stream tensors (materialize: %s)\n",
+    LLAMA_LOG_INFO("llama_model_loader: ninths (k9) model with %zu stream tensors (materialize: %s)\n",
             k9_meta.size(), k9_dst_type == GGML_TYPE_Q8_0 ? "q8_0" : "f16");
 }
 
@@ -71,6 +99,9 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_BF16:      name = LLAMA_FTYPE_PREFIX "BF16"; break;
         case LLAMA_FTYPE_MOSTLY_Q1_0:      name = LLAMA_FTYPE_PREFIX "Q1_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q2_0:      name = LLAMA_FTYPE_PREFIX "Q2_0"; break;
+        case LLAMA_FTYPE_MOSTLY_K9_4:      name = LLAMA_FTYPE_PREFIX "K9_4"; break;
+        case LLAMA_FTYPE_MOSTLY_K9_6:      name = LLAMA_FTYPE_PREFIX "K9_6"; break;
+        case LLAMA_FTYPE_MOSTLY_K9_7:      name = LLAMA_FTYPE_PREFIX "K9_7"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_0:      name = LLAMA_FTYPE_PREFIX "Q4_0"; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1:      name = LLAMA_FTYPE_PREFIX "Q4_1"; break;
         case LLAMA_FTYPE_MOSTLY_Q5_0:      name = LLAMA_FTYPE_PREFIX "Q5_0"; break;
@@ -817,6 +848,9 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
+            case GGML_TYPE_K9_4:    ftype = LLAMA_FTYPE_MOSTLY_K9_4;    break;
+            case GGML_TYPE_K9_6:    ftype = LLAMA_FTYPE_MOSTLY_K9_6;    break;
+            case GGML_TYPE_K9_7:    ftype = LLAMA_FTYPE_MOSTLY_K9_7;    break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1390,8 +1424,15 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     {
         const struct ggml_tensor * k9_g = get_tensor_meta(tn.str().c_str());
         if (k9_g != nullptr && k9_g->type == GGML_TYPE_K9) {
-            if (ne.size() != 2) {
-                GGML_ABORT("K9 tensor %s must be 2D", tn.str().c_str());
+            // K9 supports tensors of any rank. The stored frame is always the
+            // 2-D (out, in) grid; for a rank-3 expert tensor (e.g. MoE
+            // ffn_gate_up_exps {in, out, n_expert}) the experts are stored
+            // back-to-back along the expert axis, which is byte-identical to a
+            // flattened 2-D frame {out*n_expert, in} (ggml is ne[0]-contiguous).
+            // So we build the ggml tensor at the model's true rank (for the
+            // expert-routing ops) but hand the decoder the flattened 2-D shape.
+            if (ne.size() < 2 || ne.size() > GGML_MAX_DIMS) {
+                GGML_ABORT("K9 tensor %s must be 2-D..%d-D", tn.str().c_str(), (int) GGML_MAX_DIMS);
             }
             const auto it = k9_meta.find(tn.str());
             if (it == k9_meta.end()) {
@@ -1400,22 +1441,31 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             const k9_tensor_meta & meta = it->second;
             const ggml_type dst = (meta.perm_flag != 0) ? GGML_TYPE_F16 : k9_dst_type;
 
+            // flattened 2-D stored frame: ne0 = out (cols), ne1 = in*n_expert (rows)
+            int64_t f_ne0 = 1, f_ne1 = 1;
+            for (size_t d = 0; d < ne.size(); ++d) {
+                if (d == 0)      f_ne0 = ne.begin()[0];
+                else             f_ne1 *= ne.begin()[d];
+            }
+
             ggml_tensor t_meta;
             memset(&t_meta, 0, sizeof(ggml_tensor));
             t_meta.type = dst;
-            t_meta.ne[0] = ne.begin()[0];
-            t_meta.ne[1] = ne.begin()[1];
-            t_meta.ne[2] = 1;
-            t_meta.ne[3] = 1;
+            for (size_t dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+                t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            }
+            // strides for a contiguous flattened layout (ne[0] fastest):
+            // nb[0] = elem, nb[1] = row (out cols), nb[2..] = expert slices
             t_meta.nb[0] = ggml_type_size(dst);
             t_meta.nb[1] = ggml_row_size(dst, t_meta.ne[0]);
-            t_meta.nb[2] = ggml_row_size(dst, t_meta.ne[0]) * t_meta.ne[1];
-            t_meta.nb[3] = ggml_row_size(dst, t_meta.ne[0]) * t_meta.ne[1];
+            for (size_t dim = 2; dim < GGML_MAX_DIMS; ++dim) {
+                t_meta.nb[dim] = t_meta.nb[dim - 1] * t_meta.ne[dim - 1];
+            }
             ggml_set_name(&t_meta, tn.str().c_str());
 
-            if ((uint32_t) ne.begin()[0] != meta.shape[1] || (uint32_t) ne.begin()[1] != meta.shape[0]) {
-                throw std::runtime_error(format("k9: tensor %s shape (ne0=%d, ne1=%d) does not match the k9.directory stored shape (%d, %d)",
-                    tn.str().c_str(), (int) ne.begin()[0], (int) ne.begin()[1], (int) meta.shape[0], (int) meta.shape[1]));
+            if ((uint32_t) f_ne0 != meta.shape[1] || (uint32_t) f_ne1 != meta.shape[0]) {
+                throw std::runtime_error(format("k9: tensor %s flattened shape (ne0=%d, ne1=%d) does not match the k9.directory stored shape (%d, %d)",
+                    tn.str().c_str(), (int) f_ne0, (int) f_ne1, (int) meta.shape[0], (int) meta.shape[1]));
             }
             if ((int64_t) meta.group * (ne.begin()[0] / meta.group) != ne.begin()[0]) {
                 throw std::runtime_error(format("k9: tensor %s columns (%d) not divisible by group %d",
@@ -1850,7 +1900,12 @@ bool llama_model_loader::load_all_data(
             }
             std::vector<uint8_t> decoded(n_size);
             std::string err;
-            if (!k9_dequantize(blob, blob_len, it->second, cur->ne, cur->type, decoded.data(), err)) {
+            // decode against the flattened 2-D stored frame (see create_tensor):
+            // ne[0] = out (cols), ne[1] = in*n_expert (rows). The n_size above is
+            // the materialized tensor size, which equals the flattened frame size.
+            const int64_t f_ne[2] = { (int64_t) cur->ne[0],
+                (int64_t) cur->ne[1] * (cur->ne[2] * cur->ne[3]) };
+            if (!k9_dequantize(blob, blob_len, it->second, f_ne, cur->type, decoded.data(), err)) {
                 throw std::runtime_error(format("failed to decode K9 tensor %s: %s", ggml_get_name(cur), err.c_str()));
             }
             if (cur->data == nullptr) {

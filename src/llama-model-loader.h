@@ -128,12 +128,14 @@ struct llama_model_loader {
     const llama_model_tensor_buft_override * tensor_buft_overrides;
 
     // K9 (fork): compressed stream tensors, decoded on load; the destination
-    // type is configurable via the "k9.materialize" KV key (default Q8_0,
-    // exact for odd-grid digits; permuted GPTQ tensors are forced to F16).
+    // type is configurable via the "ninths.materialize" KV key (legacy alias
+    // "k9.materialize" accepted; default Q8_0, exact for odd-grid digits;
+    // permuted GPTQ tensors are forced to F16). The directory KV follows the
+    // same aliasing: "ninths.directory" primary, "k9.directory" legacy.
     std::map<std::string, k9_tensor_meta> k9_meta;
     ggml_type k9_dst_type = GGML_TYPE_Q8_0;
 
-    // parse "k9.directory" KV if present (no-op for regular GGUF models)
+    // parse the ninths/k9 directory KV if present (no-op for regular GGUF models)
     void k9_load_meta();
 
     gguf_context_ptr metadata_ptr;
