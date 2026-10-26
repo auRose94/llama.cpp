@@ -51,31 +51,46 @@ void llama_model_loader::k9_load_meta() {
     } else if (!k9_parse_directory(data, n, k9_meta, err)) {
         throw std::runtime_error(format("failed to parse k9.directory: %s", err.c_str()));
     }
-    int kid_dst = gguf_find_key(metadata, "ninths.materialize");
-    if (kid_dst != -1) {
-        const std::string t = gguf_get_val_str(metadata, kid_dst);
+
+    // materialize target precedence: K9_MATERIALIZE env > ninths.materialize
+    // KV > legacy k9.materialize KV > q8_0. The env override exists so the
+    // same container can be served at different memory/quality points
+    // (iq4_nl = full-GPU fit at ~4.5 bpw; q8_0 = bit-exact default).
+    const char * env = getenv("K9_MATERIALIZE");
+    if (env) {
+        const std::string t = env;
         if (t == "q8_0") {
             k9_dst_type = GGML_TYPE_Q8_0;
         } else if (t == "f16") {
             k9_dst_type = GGML_TYPE_F16;
+        } else if (t == "iq4_nl") {
+            k9_dst_type = GGML_TYPE_IQ4_NL;
         } else {
-            throw std::runtime_error(format("unsupported ninths.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+            throw std::runtime_error(format("unsupported K9_MATERIALIZE type '%s' (want q8_0, f16 or iq4_nl)", t.c_str()));
         }
+        LLAMA_LOG_WARN("k9_load_meta: K9_MATERIALIZE env override -> %s\n", t.c_str());
     } else {
-        kid_dst = gguf_find_key(metadata, "k9.materialize");
+        int kid_dst = gguf_find_key(metadata, "ninths.materialize");
+        const char * name = "ninths.materialize";
+        if (kid_dst == -1) {
+            kid_dst = gguf_find_key(metadata, "k9.materialize");
+            name = "k9.materialize";
+        }
         if (kid_dst != -1) {
             const std::string t = gguf_get_val_str(metadata, kid_dst);
             if (t == "q8_0") {
                 k9_dst_type = GGML_TYPE_Q8_0;
             } else if (t == "f16") {
                 k9_dst_type = GGML_TYPE_F16;
+            } else if (t == "iq4_nl") {
+                k9_dst_type = GGML_TYPE_IQ4_NL;
             } else {
-                throw std::runtime_error(format("unsupported k9.materialize type '%s' (want q8_0 or f16)", t.c_str()));
+                throw std::runtime_error(format("unsupported %s type '%s' (want q8_0, f16 or iq4_nl)", name, t.c_str()));
             }
         }
     }
-    LLAMA_LOG_INFO("llama_model_loader: ninths (k9) model with %zu stream tensors (materialize: %s)\n",
-            k9_meta.size(), k9_dst_type == GGML_TYPE_Q8_0 ? "q8_0" : "f16");
+    LLAMA_LOG_WARN("k9_load_meta: %zu stream tensors, materialize target %s\n",
+            k9_meta.size(), ggml_type_name(k9_dst_type));
 }
 
 const char * llama_file_version_name(llama_fver version) {
@@ -1439,7 +1454,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 throw std::runtime_error(format("k9.directory has no record for tensor %s", tn.str().c_str()));
             }
             const k9_tensor_meta & meta = it->second;
-            const ggml_type dst = (meta.perm_flag != 0) ? GGML_TYPE_F16 : k9_dst_type;
+            // IQ4_NL rematerialization is lossy; keep embeds/output heads on
+            // the exact path so the unembedding stays full precision.
+            const ggml_type dst = (meta.perm_flag != 0) ? GGML_TYPE_F16
+                : (k9_dst_type == GGML_TYPE_IQ4_NL && meta.k >= 99) ? GGML_TYPE_Q8_0
+                : k9_dst_type;
 
             // flattened 2-D stored frame: ne0 = out (cols), ne1 = in*n_expert (rows)
             int64_t f_ne0 = 1, f_ne1 = 1;

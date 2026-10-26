@@ -66,8 +66,9 @@ bool k9_parse_directory2(const uint8_t * data, size_t n_bytes,
 // Decode one K9 blob into dequantized weights, writing ggml_nbytes-ordered raw
 // data for a 2-D materialized tensor of type dst_type with shape ne[2 dims].
 // ne is the GGUF (transposed) shape: ne[0] == stored columns, ne[1] == stored
-// rows. dst_type must be GGML_TYPE_Q8_0 (perm_flag must be 0) or GGML_TYPE_F16.
-// Returns false on malformed input/unsupported mode.
+// rows. dst_type must be GGML_TYPE_Q8_0 (perm_flag must be 0), GGML_TYPE_F16,
+// or GGML_TYPE_IQ4_NL (lossy rematerialization; permuted tensors and k>=99
+// aux tensors stay Q8_0). Returns false on malformed input/unsupported mode.
 bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
                    const int64_t ne[2], ggml_type dst_type, void * dest, std::string & err);
 

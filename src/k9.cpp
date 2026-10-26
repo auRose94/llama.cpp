@@ -27,6 +27,22 @@ typedef struct {
 } block_q8_0;
 static_assert(sizeof(block_q8_0) == sizeof(ggml_fp16_t) + QK8_0, "wrong q8_0 block size/padding");
 
+// Local IQ4_NL copies (ggml-common.h/ggml-quants.c are not on this include
+// path) — must stay byte-compatible with upstream: 16-entry codebook,
+// 18-byte blocks (f16 scale + 16 packed nibble bytes), qs[j] = L[j] |
+// (L[j+16] << 4).
+#ifndef QK4_NL
+#define QK4_NL 32
+#endif
+typedef struct {
+    ggml_fp16_t d;        // delta
+    uint8_t     qs[QK4_NL / 2];
+} block_iq4_nl;
+static const int8_t k9_iq4nl_values[16] = {
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+};
+static_assert(sizeof(block_iq4_nl) == sizeof(ggml_fp16_t) + QK4_NL / 2, "wrong iq4_nl block size/padding");
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -385,8 +401,9 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
             return false;
         }
 
-        if (dst_type != GGML_TYPE_Q8_0 && dst_type != GGML_TYPE_F16) {
-            err = "k9 materialization supports Q8_0/F16 only";
+        if (dst_type != GGML_TYPE_Q8_0 && dst_type != GGML_TYPE_F16 &&
+                dst_type != GGML_TYPE_IQ4_NL) {
+            err = "k9 materialization supports Q8_0/F16/IQ4_NL only";
             return false;
         }
         if (meta.perm_flag && dst_type == GGML_TYPE_Q8_0) {
@@ -447,6 +464,57 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
                         for (int64_t t = 0; t < meta.group; t++) {
                             const float v = (m * ((float) row_digits[j * meta.group + t] - (float) H)) / (float) H;
                             dst[j * meta.group + t] = ggml_fp32_to_fp16(v);
+                        }
+                    }
+                }
+            } else if (dst_type == GGML_TYPE_IQ4_NL) {
+                // Non-exact rematerialization (docs/11 §8): one RTN pass onto
+                // the 16-value IQ4_NL codebook, per 32-weight block, with a
+                // deliberately simple deterministic scale d = amax/113 (code
+                // 15) — the C and Python gate implementations must stay
+                // byte-identical, so no scale-search here. k99 aux tensors
+                // never land here; the loader routes them to Q8_0.
+                block_iq4_nl * blk = (block_iq4_nl *) dest;
+                float w[32];
+                for (int64_t jg = 0; jg < ng; jg++) {
+                    const float m = ms[i1 * ng + jg];
+                    for (int64_t sb = 0; sb < 2; sb++) {
+                        float amax = 0.f;
+                        for (int64_t t = 0; t < 32; t++) {
+                            const float v = (m * ((float) row_digits[jg * meta.group + sb * 32 + t] - (float) H)) / (float) H;
+                            w[t] = v;
+                            const float av = v < 0 ? -v : v;
+                            if (av > amax) {
+                                amax = av;
+                            }
+                        }
+                        block_iq4_nl * b = blk + i1 * n_blocks_per_row + 2 * jg + sb;
+                        if (amax < 1e-8f) {
+                            b->d = ggml_fp32_to_fp16(0.f);
+                            memset(b->qs, 0x88, sizeof(b->qs)); // code idx 8 pairs, d=0
+                            continue;
+                        }
+                        const float id = 1.0f / (amax / 113.0f);
+                        b->d = ggml_fp32_to_fp16(amax / 113.0f);
+                        uint8_t L[32];
+                        for (int64_t t = 0; t < 32; t++) {
+                            const float target = id * w[t];
+                            uint8_t best = 0;
+                            float bestdiff = 1e30f;
+                            for (int e = 0; e < 16; e++) {
+                                float diff = target - (float) k9_iq4nl_values[e];
+                                if (diff < 0) {
+                                    diff = -diff;
+                                }
+                                if (diff < bestdiff) {
+                                    bestdiff = diff;
+                                    best = (uint8_t) e;
+                                }
+                            }
+                            L[t] = best;
+                        }
+                        for (int t = 0; t < 16; t++) {
+                            b->qs[t] = L[t] | (uint8_t)(L[16 + t] << 4);
                         }
                     }
                 }

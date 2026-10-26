@@ -18,8 +18,8 @@
 #include "gguf.h"
 
 int main(int argc, char ** argv) {
-    if (argc != 5) {
-        fprintf(stderr, "usage: %s <model.gguf> <tensor-name> <digits|scales|weights> <out.bin>\n", argv[0]);
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "usage: %s <model.gguf> <tensor-name> <digits|scales|weights> <out.bin> [q8_0|f16|iq4_nl]\n", argv[0]);
         return 1;
     }
     const std::string fname = argv[1];
@@ -147,7 +147,13 @@ int main(int argc, char ** argv) {
         return 0;
     } else if (mode == "weights") {
         const int64_t ne[2] = { (int64_t) m.shape[1], (int64_t) m.shape[0] }; // GGUF: (c, r)
-        const ggml_type dst = m.perm_flag ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+        ggml_type dst = m.perm_flag ? GGML_TYPE_F16 : GGML_TYPE_Q8_0;
+        if (argc > 5) {
+            const std::string want = argv[5];
+            if (want == "f16") dst = GGML_TYPE_F16;
+            else if (want == "iq4_nl") dst = GGML_TYPE_IQ4_NL;
+            else if (want != "q8_0") { fprintf(stderr, "bad dst %s\n", want.c_str()); return 1; }
+        }
         const size_t nbytes = (size_t) ggml_row_size(dst, ne[0]) * ne[1];
         out.resize(nbytes);
         if (!k9_dequantize(blob.data(), blob_len, m, ne, dst, out.data(), err)) {
