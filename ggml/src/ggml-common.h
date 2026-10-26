@@ -233,6 +233,10 @@ typedef struct {
     uint8_t  qs[48];     // low nibble of u6 = code + 32, two codes per byte
     uint8_t  hh[16];     // high 2 bits of u6; byte b: codes (4b..4b+3) in bit pairs 0-1..6-7
 } block_k9_6kv;
+// NOTE (session 32): the tight 50-byte layout (qs[32]+hh[16]) regresses GPU
+// set-rows at 2048-row shapes (NaN in ds fields + off-by-one codes) while
+// the 66-byte one passes every gate — the density fix stays open until the
+// shape-dependence is understood; numerics are identical either way.
 static_assert(sizeof(block_k9_6kv) == sizeof(ggml_half) + 48 + 16, "wrong k9_6kv block size/padding");
 
 #define QK4_0 32
