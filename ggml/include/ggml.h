@@ -434,7 +434,9 @@ extern "C" {
         GGML_TYPE_K9_4    = 44, // K9_4 (ninths, stage 2): 256-code resident superblocks,
         GGML_TYPE_K9_6    = 45, //   4x fp16 scales per 64-group, pre-biased codes
         GGML_TYPE_K9_7    = 46, //   (bit-width containers, k <= 15/63/99 — docs/08)
-        GGML_TYPE_COUNT   = 47,
+        GGML_TYPE_K9_4KV  = 47, // K9_4 in KV-cache layout: 64-code superblocks, ONE fp16
+        GGML_TYPE_K9_6KV  = 48, //   scale per block, pre-biased codes (head-aligned for FA)
+        GGML_TYPE_COUNT   = 49,
     };
 
     // [TAG_GGML_PREC]

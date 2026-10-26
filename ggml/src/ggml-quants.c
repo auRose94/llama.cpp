@@ -613,6 +613,58 @@ void quantize_row_k9_7_ref(const float * GGML_RESTRICT x, block_k9_7 * GGML_REST
     }
 }
 
+// KV-cache layout variants: same grids as the K9_4/K9_6/K9_7 references, one
+// 64-code superblock per block with a single fp16 scale each.
+
+void quantize_row_k9_4kv_ref(const float * GGML_RESTRICT x, block_k9_4kv * GGML_RESTRICT y, int64_t k) {
+    static const int H = 7;              // k15 grid
+    assert(k % QK9_GROUP == 0);
+    const int nb = (int)(k / QK9_GROUP);
+    for (int i = 0; i < nb; i++) {
+        const float * GGML_RESTRICT xb = x + i*QK9_GROUP;
+        block_k9_4kv * GGML_RESTRICT yb = &y[i];
+        float amax = 0.0f;
+        for (int j = 0; j < QK9_GROUP; j++) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        const ggml_half s = GGML_FP32_TO_FP16(MAX(amax / (float) H, 1e-4f));
+        const float d = GGML_FP16_TO_FP32(s);
+        yb->ds = s;
+        for (int j = 0; j < 32; ++j) {
+            const int c0 = MAX(-H, MIN(H, (int) roundf(xb[2*j    ] / d)));
+            const int c1 = MAX(-H, MIN(H, (int) roundf(xb[2*j + 1] / d)));
+            yb->qs[j] = (uint8_t) (((c0 + 8) & 0x0F) | (((c1 + 8) & 0x0F) << 4));
+        }
+    }
+}
+
+void quantize_row_k9_6kv_ref(const float * GGML_RESTRICT x, block_k9_6kv * GGML_RESTRICT y, int64_t k) {
+    static const int H = 31;             // k63 grid
+    assert(k % QK9_GROUP == 0);
+    const int nb = (int)(k / QK9_GROUP);
+    for (int i = 0; i < nb; i++) {
+        const float * GGML_RESTRICT xb = x + i*QK9_GROUP;
+        block_k9_6kv * GGML_RESTRICT yb = &y[i];
+        float amax = 0.0f;
+        for (int j = 0; j < QK9_GROUP; j++) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+        const ggml_half s = GGML_FP32_TO_FP16(MAX(amax / (float) H, 1e-4f));
+        const float d = GGML_FP16_TO_FP32(s);
+        yb->ds = s;
+        memset(yb->hh, 0, sizeof(yb->hh));
+        for (int j = 0; j < QK9_GROUP; ++j) {
+            const int c = MAX(-H, MIN(H, (int) roundf(xb[j] / d))) + 32;   // u6
+            const uint8_t lb = (uint8_t) (c & 0x0F);
+            const int h = (c >> 4) & 0x03;
+            const uint8_t lb_old = yb->qs[j >> 1];
+            yb->qs[j >> 1] = (j & 1) ? (uint8_t) ((lb_old & 0x0F) | (lb << 4))
+                                     : (uint8_t) ((lb_old & 0xF0) | lb);
+            yb->hh[j >> 2] |= (uint8_t) (h << ((j & 3) * 2));
+        }
+    }
+}
+
 // Chunk quantizers (imatrix ignored — plain RTN, v1 scope, docs/08).
 
 size_t quantize_k9_4(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
@@ -658,6 +710,71 @@ size_t quantize_k9_7(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, 
         qrow += row_size;
     }
     return nrow * row_size;
+}
+
+// KV-cache layout variants: same grid, ONE 64-code superblock per block
+// (docs/08 digit grid, pre-biased codes). FA per-head views of 64/128/256
+// split exactly at these block boundaries.
+
+size_t quantize_k9_4kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);
+    if (n_per_row % QK9_GROUP != 0) {
+        return 0;
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_K9_4KV, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_k9_4kv_ref(src, (block_k9_4kv *) qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+size_t quantize_k9_6kv(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    UNUSED(quant_weights);
+    if (n_per_row % QK9_GROUP != 0) {
+        return 0;
+    }
+    size_t row_size = ggml_row_size(GGML_TYPE_K9_6KV, n_per_row);
+    char * qrow = (char *) dst;
+    for (int64_t row = 0; row < nrow; ++row) {
+        quantize_row_k9_6kv_ref(src, (block_k9_6kv *) qrow, n_per_row);
+        src += n_per_row;
+        qrow += row_size;
+    }
+    return nrow * row_size;
+}
+
+void dequantize_row_k9_4kv(const block_k9_4kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK9_GROUP;
+    assert(k % qk == 0);
+    const int nb = (int)(k / qk);
+    for (int i = 0; i < nb; i++) {
+        const block_k9_4kv * GGML_RESTRICT b = &x[i];
+        const float d = GGML_FP16_TO_FP32(b->ds);
+        for (int j = 0; j < 32; ++j) {
+            const uint8_t byte = b->qs[j];
+            y[i*qk + 2*j]     = ((int)(byte & 0x0F) - 8) * d;
+            y[i*qk + 2*j + 1] = ((int)(byte >>   4) - 8) * d;
+        }
+    }
+}
+
+void dequantize_row_k9_6kv(const block_k9_6kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK9_GROUP;
+    assert(k % qk == 0);
+    const int nb = (int)(k / qk);
+    for (int i = 0; i < nb; i++) {
+        const block_k9_6kv * GGML_RESTRICT b = &x[i];
+        const float d = GGML_FP16_TO_FP32(b->ds);
+        for (int j = 0; j < QK9_GROUP; ++j) {
+            const uint8_t lb = b->qs[j >> 1];
+            const int nib = (j & 1) ? (lb >> 4) : (lb & 0x0F);
+            const int h = (b->hh[j >> 2] >> ((j & 3) * 2)) & 0x03;
+            y[i*qk + j] = ((int)((nib | (h << 4)) - 32)) * d;
+        }
+    }
 }
 
 void dequantize_row_q4_0(const block_q4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {

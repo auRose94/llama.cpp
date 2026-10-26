@@ -219,6 +219,22 @@ typedef struct {
 } block_k9_7;
 static_assert(sizeof(block_k9_7) == 4*sizeof(ggml_half) + 256, "wrong k9_7 block size/padding");
 
+// KV-cache layout variants: ONE 64-code superblock per block, one fp16 scale.
+// Head dims (64/128/256) are exact multiples of 64, so FA per-head views
+// always start at a block boundary — same grid semantics as K9_4/K9_6 above.
+typedef struct {
+    ggml_half ds;        // scale for the whole 64-code block
+    uint8_t  qs[32];     // nibble pairs; byte b: code (2b) low = (nibble - 8), code (2b+1) high
+} block_k9_4kv;
+static_assert(sizeof(block_k9_4kv) == sizeof(ggml_half) + 32, "wrong k9_4kv block size/padding");
+
+typedef struct {
+    ggml_half ds;        // scale for the whole 64-code block
+    uint8_t  qs[48];     // low nibble of u6 = code + 32, two codes per byte
+    uint8_t  hh[16];     // high 2 bits of u6; byte b: codes (4b..4b+3) in bit pairs 0-1..6-7
+} block_k9_6kv;
+static_assert(sizeof(block_k9_6kv) == sizeof(ggml_half) + 48 + 16, "wrong k9_6kv block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta

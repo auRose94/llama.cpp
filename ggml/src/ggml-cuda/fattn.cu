@@ -489,6 +489,19 @@ static fattn_vec_case_t ggml_cuda_get_fattn_vec_case(const int64_t head_size, co
     FATTN_VEC_CASES_ALL_D(Q8_0, BF16)
     FATTN_VEC_CASES_ALL_D(BF16, BF16)
 
+    // ninths KV-cache types (stage 2): compiled only when the build's
+    // GGML_CUDA_FA_QUANTS lists them (common.cmake FA_TYPES)
+    FATTN_VEC_CASES_ALL_D(K9_4KV, F16)
+    FATTN_VEC_CASES_ALL_D(K9_4KV, Q8_0)
+    FATTN_VEC_CASES_ALL_D(K9_4KV, BF16)
+    FATTN_VEC_CASES_ALL_D(K9_4KV, K9_4KV)
+    FATTN_VEC_CASES_ALL_D(K9_4KV, K9_6KV)
+    FATTN_VEC_CASES_ALL_D(K9_6KV, F16)
+    FATTN_VEC_CASES_ALL_D(K9_6KV, Q8_0)
+    FATTN_VEC_CASES_ALL_D(K9_6KV, BF16)
+    FATTN_VEC_CASES_ALL_D(K9_6KV, K9_4KV)
+    FATTN_VEC_CASES_ALL_D(K9_6KV, K9_6KV)
+
     return nullptr;
 }
 
@@ -531,6 +544,8 @@ static bool ggml_cuda_fattn_kv_type_supported(const ggml_type type) {
         case GGML_TYPE_Q5_0:
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_K9_4KV:
+        case GGML_TYPE_K9_6KV:
             return true;
         default:
             return false;

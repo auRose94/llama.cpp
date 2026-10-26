@@ -42,6 +42,14 @@ void quantize_row_k9_7(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, in
     quantize_row_k9_7_ref(x, y, k);
 }
 
+void quantize_row_k9_4kv(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_k9_4kv_ref(x, y, k);
+}
+
+void quantize_row_k9_6kv(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_k9_6kv_ref(x, y, k);
+}
+
 void quantize_row_q4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
     quantize_row_q4_0_ref(x, y, k);
 }
@@ -332,6 +340,95 @@ void ggml_vec_dot_k9_6_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, c
 
             sumf += d0 * sumi;
         }
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_k9_4kv_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK9_GROUP;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_k9_4kv * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_k9_4kv * GGML_RESTRICT xb = &x[i];
+        const float d0 = GGML_CPU_FP16_TO_FP32(xb->ds);
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const int8_t * GGML_RESTRICT qy = yb->qs;
+
+            int sumi_block = 0;
+            for (int b = 0; b < 16; ++b) {
+                const uint8_t byte = xb->qs[16*k + b];
+                sumi_block += ((int)(byte & 0x0F) - 8) * qy[2*b    ]
+                           +  ((int)(byte >>   4) - 8) * qy[2*b + 1];
+            }
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
+    }
+
+    *s = sumf;
+}
+
+void ggml_vec_dot_k9_6kv_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    const int qk = QK9_GROUP;
+    const int nb = n / qk;
+
+    assert(n % qk == 0);
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+
+    const block_k9_6kv * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    float sumf = 0.0f;
+
+    for (int i = 0; i < nb; i++) {
+        const block_k9_6kv * GGML_RESTRICT xb = &x[i];
+        const float d0 = GGML_CPU_FP16_TO_FP32(xb->ds);
+        const uint8_t * GGML_RESTRICT hh = xb->hh;
+
+        float sumi = 0.0f;
+
+        for (int k = 0; k < 2; k++) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[i*2 + k];
+            const float d1 = GGML_CPU_FP16_TO_FP32(yb->d);
+            const int8_t * GGML_RESTRICT qy = yb->qs;
+
+            int sumi_block = 0;
+            for (int b = 0; b < 16; ++b) {
+                const int c0 = 32*k + 2*b;
+                const int c1 = c0 + 1;
+                const uint8_t lb = xb->qs[16*k + b];
+                const int h0 = (hh[c0 >> 2] >> ((c0 & 3) * 2)) & 0x03;
+                const int h1 = (hh[c1 >> 2] >> ((c1 & 3) * 2)) & 0x03;
+                sumi_block += ((int)((lb & 0x0F) | (h0 << 4)) - 32) * qy[2*b    ]
+                           +  ((int)((lb >> 4)    | (h1 << 4)) - 32) * qy[2*b + 1];
+            }
+            sumi += d1 * sumi_block;
+        }
+
+        sumf += d0 * sumi;
     }
 
     *s = sumf;

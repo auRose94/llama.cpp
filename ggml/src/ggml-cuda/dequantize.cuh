@@ -119,6 +119,34 @@ static __device__ __forceinline__ void dequantize_q8_0(const void * vx, const in
     v.y *= d;
 }
 
+// ninths KV layouts (qr=1 contract: iqs is an even ELEMENT index inside the
+// 64-code block; the pair is elements (iqs, iqs+1))
+
+static __device__ __forceinline__ void dequantize_k9_4kv(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_k9_4kv * x = (const block_k9_4kv *) vx;
+
+    const float d = (float) x[ib].ds;
+    const uint8_t byte = x[ib].qs[iqs >> 1];
+
+    v.x = ((int)(byte & 0x0F) - 8) * d;
+    v.y = ((int)(byte >>   4) - 8) * d;
+}
+
+static __device__ __forceinline__ void dequantize_k9_6kv(const void * vx, const int64_t ib, const int iqs, float2 & v){
+    const block_k9_6kv * x = (const block_k9_6kv *) vx;
+
+    const float d = (float) x[ib].ds;
+    const uint8_t byte = x[ib].qs[iqs >> 1];
+    const int nib0 = (int)(byte & 0x0F);
+    const int nib1 = (int)(byte >>   4);
+    const int h0 = (x[ib].hh[iqs >> 2] >> ((iqs & 3) * 2)) & 0x03;
+    const int iqs1 = iqs + 1;
+    const int h1 = (x[ib].hh[iqs1 >> 2] >> ((iqs1 & 3) * 2)) & 0x03;
+
+    v.x = ((int)((nib0 | (h0 << 4)) - 32)) * d;
+    v.y = ((int)((nib1 | (h1 << 4)) - 32)) * d;
+}
+
 //================================== k-quants
 
 // Each call dequantizes one super-block of QK_K values into y using the

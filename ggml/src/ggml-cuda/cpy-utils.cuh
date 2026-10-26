@@ -207,6 +207,77 @@ static __device__ void cpy_blck_f32_q8_0(const char * cxi, char * cdsti) {
     quantize_f32_q8_0_block((const float *)cxi, (block_q8_0 *)cdsti);
 }
 
+// ninths KV layouts: per-64 fp16 scale, pre-biased codes (docs/08 grid).
+
+static __device__ void quantize_f32_k9_4kv_block(const float * __restrict__ x, block_k9_4kv * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK9_GROUP; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+    y->ds = fmaxf(amax / 7.0f, 1e-4f);          // k15 grid
+    const float d = (float) y->ds;
+    for (int j = 0; j < QK9_GROUP/2; ++j) {
+        int c0 = (int) roundf(x[2*j    ] / d);
+        int c1 = (int) roundf(x[2*j + 1] / d);
+        c0 = (int) fminf(fmaxf(c0, -7), 7);
+        c1 = (int) fminf(fmaxf(c1, -7), 7);
+        y->qs[j] = (uint8_t) (((c0 + 8) & 0x0F) | (((c1 + 8) & 0x0F) << 4));
+    }
+}
+
+static __device__ void quantize_f32_k9_6kv_block(const float * __restrict__ x, block_k9_6kv * __restrict__ y) {
+    float amax = 0.0f;
+    for (int j = 0; j < QK9_GROUP; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+    y->ds = fmaxf(amax / 31.0f, 1e-4f);         // k63 grid
+    const float d = (float) y->ds;
+    for (int j = 0; j < 16; ++j) {
+        y->hh[j] = 0;
+    }
+    for (int j = 0; j < QK9_GROUP; ++j) {
+        int c = (int) roundf(x[j] / d);
+        c = (int) fminf(fmaxf(c, -31), 31) + 32;    // u6 = code + 32
+        const uint8_t lb = (uint8_t) (c & 0x0F);
+        const uint8_t h  = (uint8_t) ((c >> 4) & 0x03);
+        const uint8_t lb_old = y->qs[j >> 1];
+        y->qs[j >> 1] = (j & 1) ? (uint8_t) ((lb_old & 0x0F) | (lb << 4))
+                                : (uint8_t) ((lb_old & 0xF0) | lb);
+        y->hh[j >> 2] |= (uint8_t) (h << ((j & 3) * 2));
+    }
+}
+
+static __device__ void cpy_blck_f32_k9_4kv(const char * cxi, char * cdsti) {
+    quantize_f32_k9_4kv_block((const float *)cxi, (block_k9_4kv *)cdsti);
+}
+
+static __device__ void cpy_blck_f32_k9_6kv(const char * cxi, char * cdsti) {
+    quantize_f32_k9_6kv_block((const float *)cxi, (block_k9_6kv *)cdsti);
+}
+
+static __device__ void cpy_blck_k9_4kv_f32(const char * cxi, char * cdsti) {
+    const block_k9_4kv * x = (const block_k9_4kv *) cxi;
+    float * cdstf = (float *) cdsti;
+    const float d = (float) x->ds;
+    for (int j = 0; j < QK9_GROUP/2; ++j) {
+        const uint8_t byte = x->qs[j];
+        *(cdstf + 2*j)     = ((int)(byte & 0x0F) - 8) * d;
+        *(cdstf + 2*j + 1) = ((int)(byte >>   4) - 8) * d;
+    }
+}
+
+static __device__ void cpy_blck_k9_6kv_f32(const char * cxi, char * cdsti) {
+    const block_k9_6kv * x = (const block_k9_6kv *) cxi;
+    float * cdstf = (float *) cdsti;
+    const float d = (float) x->ds;
+    for (int j = 0; j < QK9_GROUP; ++j) {
+        const uint8_t lb = x->qs[j >> 1];
+        const int nib = (j & 1) ? (lb >> 4) : (lb & 0x0F);
+        const int h = (x->hh[j >> 2] >> ((j & 3) * 2)) & 0x03;
+        *(cdstf + j) = (float)((int)((nib | (h << 4)) - 32)) * d;
+    }
+}
+
 static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
