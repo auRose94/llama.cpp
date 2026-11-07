@@ -1889,12 +1889,20 @@ bool llama_model_loader::load_all_data(
     // storage (they must not alias the mmap of the GGUF); gather their total
     // size and allocate one CPU buffer lazily on first use.
     size_t k9_total = 0;
+    size_t k9_max = 0;
     if (!k9_meta.empty()) {
         for (ggml_tensor * t : tensors) {
             const auto * w = get_weight(ggml_get_name(t));
             if (w && w->tensor->type == GGML_TYPE_K9) {
-                k9_total += ggml_nbytes(t);
+                const size_t nb = ggml_nbytes(t);
+                k9_total += nb;
+                k9_max = std::max(k9_max, nb);
             }
+        }
+        // v3 M2.5: the budget-sized arena must exist before any K9 tensor
+        // is homed (and before the scheduler's first reserve).
+        if (k9_residency::active()) {
+            k9_residency::get().prepare_arena(k9_total, k9_max);
         }
     }
     ggml_backend_buffer_t k9_buf = nullptr;
@@ -1940,25 +1948,23 @@ bool llama_model_loader::load_all_data(
                     auto & mmap_used = mmaps_used[weight->idx];
                     mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                     mmap_used.second = std::max(mmap_used.second, weight->offs + blob_len);
-                    // Give the tensor its stable home in k9_buf WITHOUT
-                    // decoding — otherwise the scheduler would allocate the
-                    // un-homed tensor into its compute buffer and lazily
-                    // filled bytes would not be what the ops read.
+                    // M2.5: dummy-home into the BUDGET arena (all tensors
+                    // overlap at the zeroed poison slab) so the scheduler
+                    // never re-homes them into its transient compute
+                    // buffers; ensure_graph re-points data into real slots
+                    // per token and LRU-evicts by freeing them.
+                    bool in_arena = true;
                     if (cur->data == nullptr) {
-                        if (k9_buf == nullptr) {
-                            k9_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), k9_total);
-                            ggml_backend_buffer_set_usage(k9_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-                        }
-                        ggml_backend_tensor_alloc(k9_buf, cur,
-                                (uint8_t *) ggml_backend_buffer_get_base(k9_buf) + k9_used);
-                        k9_used += n_size;
+                        in_arena = k9_residency::get().home_dummy(cur);
+                    } else {
+                        in_arena = false; // homed elsewhere — external
                     }
                     const int64_t f_ne[2] = { (int64_t) cur->ne[0],
                         (int64_t) cur->ne[1] * (cur->ne[2] * cur->ne[3]) };
                     k9_residency::get().register_tensor(ggml_get_name(cur),
                             (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs,
                             blob_len, it->second, f_ne,
-                            cur->type, cur, n_size);
+                            cur->type, cur, n_size, in_arena);
                     size_done += n_size;
                     continue;
                 }
