@@ -19,7 +19,7 @@
 
 int main(int argc, char ** argv) {
     if (argc != 5 && argc != 6) {
-        fprintf(stderr, "usage: %s <model.gguf> <tensor-name> <digits|scales|weights> <out.bin> [q8_0|f16|iq4_nl]\n", argv[0]);
+        fprintf(stderr, "usage: %s <model.gguf> <tensor-name|ALL> <digits|scales|weights|pages> <out.bin|-> [q8_0|f16|iq4_nl]\n", argv[0]);
         return 1;
     }
     const std::string fname = argv[1];
@@ -68,6 +68,102 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "k9_parse_directory failed: %s\n", err.c_str());
         return 1;
     }
+
+    if (mode == "pages") {
+        // v3 gate (docs/13 §2.4 #2 at primitive level): materialize every
+        // paged tensor page-by-page and require byte equality with the
+        // whole-tensor k9_dequantize output.
+        int pid = gguf_find_key(meta, "ninths.pages");
+        if (pid == -1) {
+            fprintf(stderr, "no ninths.pages KV in %s — not a v3 paged file\n", fname.c_str());
+            return 1;
+        }
+        std::map<std::string, k9_page_meta> pages;
+        if (!k9_parse_pages((const uint8_t *) gguf_get_arr_data(meta, pid),
+                            gguf_get_arr_n(meta, pid), pages, err)) {
+            fprintf(stderr, "k9_parse_pages failed: %s\n", err.c_str());
+            return 1;
+        }
+        ggml_type dst = GGML_TYPE_Q8_0;
+        if (argc > 5) {
+            const std::string want = argv[5];
+            if (want == "f16") dst = GGML_TYPE_F16;
+            else if (want == "iq4_nl") dst = GGML_TYPE_IQ4_NL;
+            else if (want != "q8_0") { fprintf(stderr, "bad dst %s\n", want.c_str()); return 1; }
+        }
+        std::vector<std::string> names;
+        if (tname == "ALL") {
+            for (const auto & kv : pages) {
+                names.push_back(kv.first);
+            }
+        } else {
+            if (pages.find(tname) == pages.end()) {
+                fprintf(stderr, "tensor %s not in ninths.pages\n", tname.c_str());
+                return 1;
+            }
+            names.push_back(tname);
+        }
+        int fails = 0;
+        for (const auto & name : names) {
+            const k9_page_meta & pm = pages[name];
+            auto mit = k9_meta.find(name);
+            if (mit == k9_meta.end()) {
+                fprintf(stderr, "  %s: not in directory\n", name.c_str());
+                fails++;
+                continue;
+            }
+            const k9_tensor_meta & m = mit->second;
+            if (pm.lanes != m.lanes || m.lanes <= 1) {
+                fprintf(stderr, "  %s: lanes mismatch pages=%u dir=%u\n",
+                        name.c_str(), pm.lanes, m.lanes);
+                fails++;
+                continue;
+            }
+            const int tid = gguf_find_tensor(meta, name.c_str());
+            if (tid == -1 || gguf_get_tensor_type(meta, tid) != GGML_TYPE_K9) {
+                fprintf(stderr, "  %s: not a K9 tensor in GGUF\n", name.c_str());
+                fails++;
+                continue;
+            }
+            const size_t blob_len = gguf_get_tensor_size(meta, tid);
+            const size_t blob_off = gguf_get_data_offset(meta) + gguf_get_tensor_offset(meta, tid);
+            std::vector<uint8_t> blob(blob_len);
+            if (fseek(fh, (long) blob_off, SEEK_SET) ||
+                    fread(blob.data(), 1, blob_len, fh) != blob_len) {
+                fprintf(stderr, "  %s: blob read failed\n", name.c_str());
+                fails++;
+                continue;
+            }
+            const int64_t ne[2] = { (int64_t) m.shape[1], (int64_t) m.shape[0] };
+            const ggml_type d2 = m.perm_flag ? GGML_TYPE_F16 : dst;
+            const size_t nbytes = (size_t) ggml_row_size(d2, ne[0]) * ne[1];
+            std::vector<uint8_t> full(nbytes);
+            std::vector<uint8_t> paged(nbytes, 0xA5); // poison fill: catches unwritten bytes
+            if (!k9_dequantize(blob.data(), blob_len, m, ne, d2, full.data(), err)) {
+                fprintf(stderr, "  %s: full dequantize failed: %s\n", name.c_str(), err.c_str());
+                fails++;
+                continue;
+            }
+            bool okp = true;
+            for (uint32_t pg = 0; pg < m.lanes && okp; pg++) {
+                if (!k9_decode_page(blob.data(), blob_len, m, ne, d2, pg, pm.page_rows,
+                                    nullptr, paged.data(), err)) {
+                    fprintf(stderr, "  %s: page %u failed: %s\n", name.c_str(), pg, err.c_str());
+                    okp = false;
+                }
+            }
+            const bool eq = okp && memcmp(full.data(), paged.data(), nbytes) == 0;
+            printf("  %-44s lanes=%3u page_rows=%u bytes=%zu %s\n", name.c_str(),
+                   m.lanes, pm.page_rows, nbytes, eq ? "PAGE-EQUAL" : "DIFF");
+            if (!eq) {
+                fails++;
+            }
+        }
+        fclose(fh);
+        printf("K9PROBE-PAGES: %s (%d failures)\n", fails ? "FAIL" : "PASS", fails);
+        return fails ? 1 : 0;
+    }
+
     auto it = k9_meta.find(tname);
     if (it == k9_meta.end()) {
         fprintf(stderr, "tensor %s not in k9.directory\n", tname.c_str());

@@ -134,6 +134,9 @@ struct llama_model_loader {
     // same aliasing: "ninths.directory" primary, "k9.directory" legacy.
     std::map<std::string, k9_tensor_meta> k9_meta;
     ggml_type k9_dst_type = GGML_TYPE_Q8_0;
+    // v3 paging marker (docs/13 §2.6): ninths.pages parse; empty when the
+    // file is not paged.
+    std::map<std::string, k9_page_meta> k9_pages;
 
     // parse the ninths/k9 directory KV if present (no-op for regular GGUF models)
     void k9_load_meta();

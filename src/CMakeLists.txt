@@ -20,6 +20,7 @@ set(LLAMA_CORE_SOURCES
     llama-graph.cpp
     llama-hparams.cpp
     k9.cpp
+    k9-residency.cpp
     llama-impl.cpp
     llama-io.cpp
     llama-kv-cache.cpp

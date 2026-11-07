@@ -227,7 +227,7 @@ bool k9_parse_directory2(const uint8_t * data, size_t n_bytes,
         m.perm_flag  = data[pos + 3];
         m.lanes      = data[pos + 4];
         pos += 5;
-        if (m.group == 0 || m.k == 0 || m.k > 255 || m.lanes == 0 || m.lanes > 64) {
+        if (m.group == 0 || m.k == 0 || m.k > 255 || m.lanes == 0 || m.lanes > 255) {
             err = "k9.directory2: unsupported k/group/lanes for " + m.name;
             return false;
         }
@@ -387,6 +387,120 @@ bool k9_decode_scales(const uint8_t * blob, size_t blob_len, const k9_tensor_met
     }
 }
 
+// v3 (docs/13 §2.6): row-packing shared by the whole-tensor path
+// (k9_dequantize) and the per-page path (k9_decode_page) so both emit
+// byte-identical materialized bytes.
+namespace {
+
+struct k9_pack_ctx {
+    ggml_type dst_type;
+    void * dest;
+    int64_t  c;      // stored columns
+    int64_t  ng;     // scale groups per row
+    uint64_t H;
+    size_t   n_blocks_per_row;
+    const k9_tensor_meta * meta;
+    const float * ms;
+    const uint32_t * perm_col; // nullptr when no act-order perm
+};
+
+static void k9_pack_row(const k9_pack_ctx & cx, const uint8_t * row_digits, int64_t i1) {
+    const int64_t c = cx.c;
+    const int64_t ng = cx.ng;
+    const uint64_t H = cx.H;
+    const k9_tensor_meta & meta = *cx.meta;
+    const float * ms = cx.ms;
+    if (cx.dst_type == GGML_TYPE_F16) {
+        ggml_fp16_t * dst = (ggml_fp16_t *) cx.dest + i1 * c;
+        if (cx.perm_col) {
+            for (int64_t j = 0; j < ng; j++) {
+                const float m = ms[i1 * ng + j];
+                for (int64_t t = 0; t < meta.group; t++) {
+                    const float v = (m * ((float) row_digits[j * meta.group + t] - (float) H)) / (float) H;
+                    dst[cx.perm_col[j * meta.group + t]] = ggml_fp32_to_fp16(v);
+                }
+            }
+        } else {
+            for (int64_t j = 0; j < ng; j++) {
+                const float m = ms[i1 * ng + j];
+                for (int64_t t = 0; t < meta.group; t++) {
+                    const float v = (m * ((float) row_digits[j * meta.group + t] - (float) H)) / (float) H;
+                    dst[j * meta.group + t] = ggml_fp32_to_fp16(v);
+                }
+            }
+        }
+    } else if (cx.dst_type == GGML_TYPE_IQ4_NL) {
+        // Non-exact rematerialization (docs/11 §8): one RTN pass onto
+        // the 16-value IQ4_NL codebook, per 32-weight block, with a
+        // deliberately simple deterministic scale d = amax/113 (code
+        // 15) — the C and Python gate implementations must stay
+        // byte-identical, so no scale-search here. k99 aux tensors
+        // never land here; the loader routes them to Q8_0.
+        block_iq4_nl * blk = (block_iq4_nl *) cx.dest;
+        float w[32];
+        for (int64_t jg = 0; jg < ng; jg++) {
+            const float m = ms[i1 * ng + jg];
+            for (int64_t sb = 0; sb < 2; sb++) {
+                float amax = 0.f;
+                for (int64_t t = 0; t < 32; t++) {
+                    const float v = (m * ((float) row_digits[jg * meta.group + sb * 32 + t] - (float) H)) / (float) H;
+                    w[t] = v;
+                    const float av = v < 0 ? -v : v;
+                    if (av > amax) {
+                        amax = av;
+                    }
+                }
+                block_iq4_nl * b = blk + i1 * cx.n_blocks_per_row + 2 * jg + sb;
+                if (amax < 1e-8f) {
+                    b->d = ggml_fp32_to_fp16(0.f);
+                    memset(b->qs, 0x88, sizeof(b->qs)); // code idx 8 pairs, d=0
+                    continue;
+                }
+                const float id = 1.0f / (amax / 113.0f);
+                b->d = ggml_fp32_to_fp16(amax / 113.0f);
+                uint8_t L[32];
+                for (int64_t t = 0; t < 32; t++) {
+                    const float target = id * w[t];
+                    uint8_t best = 0;
+                    float bestdiff = 1e30f;
+                    for (int e = 0; e < 16; e++) {
+                        float diff = target - (float) k9_iq4nl_values[e];
+                        if (diff < 0) {
+                            diff = -diff;
+                        }
+                        if (diff < bestdiff) {
+                            bestdiff = diff;
+                            best = (uint8_t) e;
+                        }
+                    }
+                    L[t] = best;
+                }
+                for (int t = 0; t < 16; t++) {
+                    b->qs[t] = L[t] | (uint8_t)(L[16 + t] << 4);
+                }
+            }
+        }
+    } else {
+        // Q8_0: blocks are 32 columns of this row; two blocks share a
+        // 64-group, so scale d = fp16(m/H) and qs = digit - H exactly.
+        block_q8_0 * blk = (block_q8_0 *) cx.dest;
+        for (int64_t j = 0; j < ng; j++) {
+            const float m = ms[i1 * ng + j];
+            const ggml_fp16_t d = ggml_fp32_to_fp16(m / (float) H);
+            block_q8_0 * b0 = blk + i1 * cx.n_blocks_per_row + 2 * j + 0;
+            block_q8_0 * b1 = blk + i1 * cx.n_blocks_per_row + 2 * j + 1;
+            b0->d = d;
+            b1->d = d;
+            for (int64_t t = 0; t < meta.group / 2; t++) {
+                b0->qs[t] = (int8_t) row_digits[j * meta.group + t] - (int8_t) H;
+                b1->qs[t] = (int8_t) row_digits[j * meta.group + meta.group / 2 + t] - (int8_t) H;
+            }
+        }
+    }
+}
+
+} // namespace
+
 bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
                    const int64_t ne[2], ggml_type dst_type, void * dest, std::string & err) {
     try {
@@ -447,94 +561,18 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
         }
 
         const size_t n_blocks_per_row = (size_t) (c / 32);
+        k9_pack_ctx cx;
+        cx.dst_type = dst_type;
+        cx.dest = dest;
+        cx.c = c;
+        cx.ng = ng;
+        cx.H = H;
+        cx.n_blocks_per_row = n_blocks_per_row;
+        cx.meta = &meta;
+        cx.ms = ms.data();
+        cx.perm_col = perm_col.empty() ? nullptr : perm_col.data();
         auto pack_row = [&](const uint8_t * row_digits, int64_t i1) {
-            if (dst_type == GGML_TYPE_F16) {
-                ggml_fp16_t * dst = (ggml_fp16_t *) dest + i1 * c;
-                if (meta.perm_flag) {
-                    for (int64_t j = 0; j < ng; j++) {
-                        const float m = ms[i1 * ng + j];
-                        for (int64_t t = 0; t < meta.group; t++) {
-                            const float v = (m * ((float) row_digits[j * meta.group + t] - (float) H)) / (float) H;
-                            dst[perm_col[j * meta.group + t]] = ggml_fp32_to_fp16(v);
-                        }
-                    }
-                } else {
-                    for (int64_t j = 0; j < ng; j++) {
-                        const float m = ms[i1 * ng + j];
-                        for (int64_t t = 0; t < meta.group; t++) {
-                            const float v = (m * ((float) row_digits[j * meta.group + t] - (float) H)) / (float) H;
-                            dst[j * meta.group + t] = ggml_fp32_to_fp16(v);
-                        }
-                    }
-                }
-            } else if (dst_type == GGML_TYPE_IQ4_NL) {
-                // Non-exact rematerialization (docs/11 §8): one RTN pass onto
-                // the 16-value IQ4_NL codebook, per 32-weight block, with a
-                // deliberately simple deterministic scale d = amax/113 (code
-                // 15) — the C and Python gate implementations must stay
-                // byte-identical, so no scale-search here. k99 aux tensors
-                // never land here; the loader routes them to Q8_0.
-                block_iq4_nl * blk = (block_iq4_nl *) dest;
-                float w[32];
-                for (int64_t jg = 0; jg < ng; jg++) {
-                    const float m = ms[i1 * ng + jg];
-                    for (int64_t sb = 0; sb < 2; sb++) {
-                        float amax = 0.f;
-                        for (int64_t t = 0; t < 32; t++) {
-                            const float v = (m * ((float) row_digits[jg * meta.group + sb * 32 + t] - (float) H)) / (float) H;
-                            w[t] = v;
-                            const float av = v < 0 ? -v : v;
-                            if (av > amax) {
-                                amax = av;
-                            }
-                        }
-                        block_iq4_nl * b = blk + i1 * n_blocks_per_row + 2 * jg + sb;
-                        if (amax < 1e-8f) {
-                            b->d = ggml_fp32_to_fp16(0.f);
-                            memset(b->qs, 0x88, sizeof(b->qs)); // code idx 8 pairs, d=0
-                            continue;
-                        }
-                        const float id = 1.0f / (amax / 113.0f);
-                        b->d = ggml_fp32_to_fp16(amax / 113.0f);
-                        uint8_t L[32];
-                        for (int64_t t = 0; t < 32; t++) {
-                            const float target = id * w[t];
-                            uint8_t best = 0;
-                            float bestdiff = 1e30f;
-                            for (int e = 0; e < 16; e++) {
-                                float diff = target - (float) k9_iq4nl_values[e];
-                                if (diff < 0) {
-                                    diff = -diff;
-                                }
-                                if (diff < bestdiff) {
-                                    bestdiff = diff;
-                                    best = (uint8_t) e;
-                                }
-                            }
-                            L[t] = best;
-                        }
-                        for (int t = 0; t < 16; t++) {
-                            b->qs[t] = L[t] | (uint8_t)(L[16 + t] << 4);
-                        }
-                    }
-                }
-            } else {
-                // Q8_0: blocks are 32 columns of this row; two blocks share a
-                // 64-group, so scale d = fp16(m/H) and qs = digit - H exactly.
-                block_q8_0 * blk = (block_q8_0 *) dest;
-                for (int64_t j = 0; j < ng; j++) {
-                    const float m = ms[i1 * ng + j];
-                    const ggml_fp16_t d = ggml_fp32_to_fp16(m / (float) H);
-                    block_q8_0 * b0 = blk + i1 * n_blocks_per_row + 2 * j + 0;
-                    block_q8_0 * b1 = blk + i1 * n_blocks_per_row + 2 * j + 1;
-                    b0->d = d;
-                    b1->d = d;
-                    for (int64_t t = 0; t < meta.group / 2; t++) {
-                        b0->qs[t] = (int8_t) row_digits[j * meta.group + t] - (int8_t) H;
-                        b1->qs[t] = (int8_t) row_digits[j * meta.group + meta.group / 2 + t] - (int8_t) H;
-                    }
-                }
-            }
+            k9_pack_row(cx, row_digits, i1);
         };
 
         unsigned hw = std::thread::hardware_concurrency();
@@ -636,6 +674,185 @@ bool k9_dequantize(const uint8_t * blob, size_t blob_len, const k9_tensor_meta &
             for (auto & th : pool) {
                 th.join();
             }
+        }
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+}
+
+// v3 paging (docs/13 §2.6): decode ONE page (page == v2 lane; rows
+// [page*page_rows, min(r, (page+1)*page_rows))) into the same buffer layout
+// k9_dequantize would produce, at that row slice. Byte-identical to the
+// corresponding rows of the full k9_dequantize output. ms may be null
+// (scales decoded fresh from the blob; callers that cache scales pass a
+// pre-decoded array of r*ng floats to skip the ent8 walk).
+bool k9_decode_page(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
+                    const int64_t ne[2], ggml_type dst_type, uint32_t page,
+                    uint32_t page_rows, const float * ms, void * dest, std::string & err) {
+    try {
+        const uint64_t H = (meta.k - 1) / 2;
+        const int64_t  c = ne[0]; // stored columns (groups axis)
+        const int64_t  r = ne[1]; // stored rows
+        const int64_t  ng = c / meta.group;
+
+        if (meta.lanes <= 1) {
+            err = "k9_decode_page requires a v2 multi-lane tensor for " + meta.name;
+            return false;
+        }
+        if (page >= meta.lanes) {
+            err = "k9 page index out of range for " + meta.name;
+            return false;
+        }
+        if ((uint32_t) ne[0] != meta.shape[1] || (uint32_t) ne[1] != meta.shape[0]) {
+            err = "k9 directory shape does not match the materialized shape for " + meta.name;
+            return false;
+        }
+        if (dst_type != GGML_TYPE_Q8_0 && dst_type != GGML_TYPE_F16 &&
+                dst_type != GGML_TYPE_IQ4_NL) {
+            err = "k9 materialization supports Q8_0/F16/IQ4_NL only";
+            return false;
+        }
+        if (meta.perm_flag && dst_type == GGML_TYPE_Q8_0) {
+            err = "k9 permuted tensor needs F16 materialization";
+            return false;
+        }
+        if (blob_len != (size_t) meta.tbl + meta.dig + meta.sca + meta.plen) {
+            err = "k9 blob length mismatch for " + meta.name;
+            return false;
+        }
+        const uint32_t rows_per = (uint32_t) ((r + (int64_t) meta.lanes - 1) / (int64_t) meta.lanes);
+        if (page_rows != rows_per) {
+            err = "k9 page_rows " + std::to_string(page_rows) + " != lane rows " +
+                  std::to_string(rows_per) + " for " + meta.name;
+            return false;
+        }
+        const size_t otab = 4ull * (meta.lanes + 1);
+        if (meta.dig < otab) {
+            err = "k9 v2 digit area truncated for " + meta.name;
+            return false;
+        }
+        const uint32_t * ot = (const uint32_t *) (blob + meta.tbl);
+        for (uint32_t i = page; i <= page + 1 && i < meta.lanes; i++) {
+            if (ot[i] > ot[i + 1]) {
+                err = "k9 v2 lane offsets not ascending for " + meta.name;
+                return false;
+            }
+        }
+        if (ot[meta.lanes] != (uint32_t) (meta.dig - otab)) {
+            err = "k9 v2 lane offset tail mismatch for " + meta.name;
+            return false;
+        }
+        const int64_t a = std::min<int64_t>(r, (int64_t) page * rows_per);
+        const int64_t b = std::min<int64_t>(r, (int64_t)(page + 1) * rows_per);
+        if (a >= b) {
+            return true; // padding lane past the last row
+        }
+
+        std::vector<float> ms_local;
+        if (ms == nullptr) {
+            ms_local.resize((size_t)(r * ng));
+            if (!k9_decode_scales(blob, blob_len, meta, r * ng, ms_local.data(), err)) {
+                return false;
+            }
+            ms = ms_local.data();
+        }
+
+        std::vector<uint32_t> perm_col;
+        if (meta.perm_flag) {
+            perm_col.resize(c);
+            const uint8_t * pd = blob + meta.tbl + meta.dig + meta.sca;
+            for (int64_t j = 0; j < c; j++) {
+                const uint32_t orig = rd_u32(pd + 4 * j);
+                if (orig >= (uint32_t) c) {
+                    err = "k9 permutation index out of range";
+                    return false;
+                }
+                perm_col[j] = orig;
+            }
+        }
+
+        rans_tables dt;
+        dt.build(blob, meta.k);
+        k9_rans_decoder dl;
+        dl.init(blob + meta.tbl + otab + ot[page], ot[page + 1] - ot[page],
+                dt.freq.data(), dt.cumul.data(), dt.inv.data());
+        std::vector<uint8_t> lane_digits((size_t)(b - a) * (size_t) c);
+        constexpr size_t CH = 1 << 24;
+        for (size_t done = 0; done < lane_digits.size(); ) {
+            const size_t take = std::min(CH, lane_digits.size() - done);
+            dl.decode(lane_digits.data() + done, take);
+            done += take;
+        }
+
+        k9_pack_ctx cx;
+        cx.dst_type = dst_type;
+        cx.dest = dest;
+        cx.c = c;
+        cx.ng = ng;
+        cx.H = H;
+        cx.n_blocks_per_row = (size_t) (c / 32);
+        cx.meta = &meta;
+        cx.ms = ms;
+        cx.perm_col = perm_col.empty() ? nullptr : perm_col.data();
+        for (int64_t i1 = a; i1 < b; i1++) {
+            k9_pack_row(cx, lane_digits.data() + (size_t)(i1 - a) * (size_t) c, i1);
+        }
+        return true;
+    } catch (const std::exception & e) {
+        err = e.what();
+        return false;
+    }
+}
+
+// Parse the "ninths.pages" KV payload (v3 paging marker, docs/13 §2.6):
+// u16 version + u16 count, per paged tensor: u16 name_len, name, u8 lanes,
+// u32 page_rows. Presence means the file was built for paging; readers that
+// do not page simply ignore the KV (no corrupt-old-reader).
+bool k9_parse_pages(const uint8_t * data, size_t n_bytes,
+                    std::map<std::string, k9_page_meta> & out, std::string & err) {
+    try {
+        size_t pos = 0;
+        if (n_bytes < 4) {
+            err = "ninths.pages truncated";
+            return false;
+        }
+        const uint16_t ver = (uint16_t)(data[pos] | (data[pos + 1] << 8));
+        const uint16_t n   = (uint16_t)(data[pos + 2] | (data[pos + 3] << 8));
+        pos += 4;
+        if (ver != 1) {
+            err = "ninths.pages: unsupported version " + std::to_string(ver);
+            return false;
+        }
+        for (uint16_t i = 0; i < n; i++) {
+            if (pos + 2 > n_bytes) {
+                err = "ninths.pages truncated (name len)";
+                return false;
+            }
+            const uint16_t nl = (uint16_t)(data[pos] | (data[pos + 1] << 8));
+            pos += 2;
+            if (pos + (size_t) nl + 5 > n_bytes) {
+                err = "ninths.pages truncated (record)";
+                return false;
+            }
+            std::string name((const char *) data + pos, nl);
+            pos += nl;
+            const uint8_t lanes = data[pos];
+            pos += 1;
+            const uint32_t page_rows = (uint32_t)(data[pos] | (data[pos + 1] << 8) |
+                                                  (data[pos + 2] << 16) |
+                                                  ((uint32_t) data[pos + 3] << 24));
+            pos += 4;
+            if (lanes == 0) {
+                err = "ninths.pages: lanes 0 for " + name;
+                return false;
+            }
+            out[name] = k9_page_meta{ lanes, page_rows };
+        }
+        if (pos != n_bytes) {
+            err = "ninths.pages: trailing bytes";
+            return false;
         }
         return true;
     } catch (const std::exception & e) {

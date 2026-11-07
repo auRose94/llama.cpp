@@ -80,3 +80,26 @@ bool k9_decode_digits(const uint8_t * blob, size_t blob_len, const k9_tensor_met
 // Exposed for probes/tests: decode scales into f32 (n values).
 bool k9_decode_scales(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
                       size_t n, float * out, std::string & err);
+
+// v3 paging marker (docs/13 §2.6): one record per paged tensor. A page IS a
+// v2 lane — rows [i*page_rows, min(r, (i+1)*page_rows)) decoded from the
+// lane offset table inside the record's digit area.
+struct k9_page_meta {
+    uint32_t lanes     = 0; // page count == v2 lane count
+    uint32_t page_rows = 0; // rows per page; last page holds the remainder
+};
+
+// Parse the "ninths.pages" KV payload (u16 version + u16 count, per paged
+// tensor: u16 name_len, name, u8 lanes, u32 page_rows).
+bool k9_parse_pages(const uint8_t * data, size_t n_bytes,
+                    std::map<std::string, k9_page_meta> & out, std::string & err);
+
+// v3 paging primitive: decode ONE page of a K9 blob into the same buffer
+// layout k9_dequantize would produce, at that page's row slice. Byte-identical
+// to the corresponding rows of the full k9_dequantize output. ms may be null
+// (scales decoded fresh; pass a pre-decoded r*ng float array to skip the
+// ent8 walk when the caller caches scales). Requires meta.lanes > 1 and
+// page < meta.lanes; page_rows must equal the lane row count.
+bool k9_decode_page(const uint8_t * blob, size_t blob_len, const k9_tensor_meta & meta,
+                    const int64_t ne[2], ggml_type dst_type, uint32_t page,
+                    uint32_t page_rows, const float * ms, void * dest, std::string & err);

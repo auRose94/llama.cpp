@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "k9-residency.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -2771,6 +2772,10 @@ ggml_status llama_context::graph_compute(
     }
 
     copy_experts.reset();
+
+    // v3 residency (docs/13 §2.6): decode-on-demand + LRU for registered K9
+    // tensors. Cheap no-op when K9_RESIDENT is off (nothing registered).
+    k9_residency::get().ensure_graph(gf);
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {

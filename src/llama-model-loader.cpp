@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "k9-residency.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -50,6 +51,27 @@ void llama_model_loader::k9_load_meta() {
         }
     } else if (!k9_parse_directory(data, n, k9_meta, err)) {
         throw std::runtime_error(format("failed to parse k9.directory: %s", err.c_str()));
+    }
+
+    // v3 paging marker (docs/13 §2.6): optional ninths.pages KV. Presence
+    // means the file was built for on-demand page residency; readers that
+    // do not page ignore the KV entirely.
+    k9_pages.clear();
+    int kid_pg = gguf_find_key(metadata, "ninths.pages");
+    if (kid_pg != -1) {
+        if (gguf_get_kv_type(metadata, kid_pg) != GGUF_TYPE_ARRAY) {
+            throw std::runtime_error("ninths.pages KV must be an array");
+        }
+        if (!k9_parse_pages((const uint8_t *) gguf_get_arr_data(metadata, kid_pg),
+                            gguf_get_arr_n(metadata, kid_pg), k9_pages, err)) {
+            throw std::runtime_error(format("failed to parse ninths.pages: %s", err.c_str()));
+        }
+        LLAMA_LOG_WARN("k9_load_meta: v3 paged file, %zu paged tensors\n", k9_pages.size());
+    }
+    // v3 residency: a fresh model load must not inherit a previous model's
+    // registered tensors (one registry per process).
+    if (k9_residency::active()) {
+        k9_residency::get().reset();
     }
 
     // materialize target precedence: K9_MATERIALIZE env > ninths.materialize
@@ -1897,6 +1919,49 @@ bool llama_model_loader::load_all_data(
             const auto it = k9_meta.find(ggml_get_name(cur));
             if (it == k9_meta.end()) {
                 throw std::runtime_error(format("k9.directory has no record for tensor %s", ggml_get_name(cur)));
+            }
+            // v3 residency (docs/13 §2.6): K9_RESIDENT=1 switches host-bound
+            // K9 tensors to lazy tensor-granular materialization (first graph
+            // use; LRU under K9_BUDGET_GIB). Requires mmap so the blob
+            // pointers outlive the loader (llama_model retains mappings);
+            // otherwise fall back to eager decode-on-load.
+            if (k9_residency::active()) {
+                if (!use_mmap) {
+                    LLAMA_LOG_WARN("k9 residency: no mmap — falling back to eager decode-on-load\n");
+                    k9_residency::disable();
+                } else {
+                    const size_t blob_len = ggml_nbytes(weight->tensor);
+                    // keep the blob range alive: the loader releases unused
+                    // mmap fragments after load, tracked via mmaps_used (and
+                    // lmlocks when mlock is on) — same as the eager path.
+                    if (lmlocks) {
+                        lmlocks->at(weight->idx)->grow_to(weight->offs + blob_len);
+                    }
+                    auto & mmap_used = mmaps_used[weight->idx];
+                    mmap_used.first  = std::min(mmap_used.first,  weight->offs);
+                    mmap_used.second = std::max(mmap_used.second, weight->offs + blob_len);
+                    // Give the tensor its stable home in k9_buf WITHOUT
+                    // decoding — otherwise the scheduler would allocate the
+                    // un-homed tensor into its compute buffer and lazily
+                    // filled bytes would not be what the ops read.
+                    if (cur->data == nullptr) {
+                        if (k9_buf == nullptr) {
+                            k9_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), k9_total);
+                            ggml_backend_buffer_set_usage(k9_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+                        }
+                        ggml_backend_tensor_alloc(k9_buf, cur,
+                                (uint8_t *) ggml_backend_buffer_get_base(k9_buf) + k9_used);
+                        k9_used += n_size;
+                    }
+                    const int64_t f_ne[2] = { (int64_t) cur->ne[0],
+                        (int64_t) cur->ne[1] * (cur->ne[2] * cur->ne[3]) };
+                    k9_residency::get().register_tensor(ggml_get_name(cur),
+                            (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs,
+                            blob_len, it->second, f_ne,
+                            cur->type, cur, n_size);
+                    size_done += n_size;
+                    continue;
+                }
             }
             const size_t blob_len = ggml_nbytes(weight->tensor);
             const uint8_t * blob = nullptr;
