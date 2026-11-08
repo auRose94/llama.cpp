@@ -24,6 +24,42 @@ static const size_t GiB = 1024*MiB;
 // ninths exporter as "ninths.directory"; "k9.directory" is the legacy alias
 // (k9 = secondary shorthand), accepted so pre-rename GGUFs keep loading.
 // Optional directory override: "ninths.materialize" / legacy "k9.materialize".
+// K9 M3: map the residency region sized to ALL K9 tensors across the
+// created contexts (must run once, before buffer creation/load — per-ctx
+// load_all_data calls only see their own ctx and would undersize it).
+void llama_model_loader::k9_prepare_residency() {
+    if (!k9_residency::active()) {
+        return;
+    }
+    size_t total = 0;
+    int n_k9_ctxs = 0, n_other_ctxs = 0;
+    for (const auto & [key, ctx] : ctx_map) {
+        size_t ctx_bytes = 0;
+        bool has_k9 = false;
+        for (auto * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+            ctx_bytes += ggml_nbytes(t);
+            if (t->type == GGML_TYPE_K9) {
+                has_k9 = true;
+            }
+        }
+        if (key.k9) {
+            n_k9_ctxs++;
+            total += ctx_bytes;
+        } else {
+            n_other_ctxs++;
+            if (has_k9) {
+                LLAMA_LOG_ERROR("k9 residency: LEAKED K9 tensor in non-K9 ctx (buft=%s)\n",
+                                ggml_backend_buft_name(key.buft));
+            }
+        }
+    }
+    LLAMA_LOG_WARN("k9 residency: ctx split: %d k9 ctxs (%.2f GiB) / %d other ctxs\n",
+                   n_k9_ctxs, total / 1073741824.0, n_other_ctxs);
+    if (total > 0) {
+        k9_residency::get().prepare_region(total);
+    }
+}
+
 void llama_model_loader::k9_load_meta() {
     // v2 (lane-interleaved streams, docs/11) lives under ninths.directory2;
     // old readers never look for that key, so a v2 file fails loudly there
@@ -69,10 +105,9 @@ void llama_model_loader::k9_load_meta() {
         LLAMA_LOG_WARN("k9_load_meta: v3 paged file, %zu paged tensors\n", k9_pages.size());
     }
     // v3 residency: a fresh model load must not inherit a previous model's
-    // registered tensors (one registry per process).
-    if (k9_residency::active()) {
-        k9_residency::get().reset();
-    }
+    // registered tensors, NOR a sticky disable() from an earlier fit pass
+    // (the fit pass loads with LOAD_MODE_NONE and disables residency)
+    k9_residency::fresh_load();
 
     // materialize target precedence: K9_MATERIALIZE env > ninths.materialize
     // KV > legacy k9.materialize KV > q8_0. The env override exists so the
@@ -1234,9 +1269,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+    bool is_k9 = false; // K9 M3: dedicated ctx for residency-managed tensors
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
-        const ctx_key key { buft, is_lazy };
+        const ctx_key key { buft, is_lazy, is_k9 };
 
         auto it = ctx_map.find(key);
         if (it == ctx_map.end()) {
@@ -1519,6 +1555,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (buft == nullptr) {
                 return nullptr;
             }
+            is_k9 = k9_residency::active(); // K9 M3: dedicated ctx (docs/13 §2.6)
             ggml_context * ctx = ctx_for_buft(buft);
 
             if (flags & TENSOR_DUPLICATED) {
@@ -1711,8 +1748,14 @@ std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_r
         if (!weight || weight->idx != idx) {
             continue;
         }
+        // K9 (fork): stream tensors never alias the mapping — they decode
+        // into the k9_buf/region instead; their materialized size exceeds
+        // their file span, so they must not join the from_ptr ranges
+        if (weight->tensor->type == GGML_TYPE_K9) {
+            continue;
+        }
         own.insert(weight);
-        own_ranges.push_back({ weight->offs, weight->offs + ggml_nbytes(tensor) });
+        own_ranges.push_back({ weight->offs, weight->offs + ggml_nbytes(weight->tensor) });
     }
 
     for (const auto & it : ctx_map) {
@@ -1725,7 +1768,10 @@ std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_r
             if (!weight || weight->idx != idx || own.count(weight)) {
                 continue;
             }
-            other.push_back({ weight->offs, weight->offs + ggml_nbytes(tensor) });
+            if (weight->tensor->type == GGML_TYPE_K9) {
+                continue;
+            }
+            other.push_back({ weight->offs, weight->offs + ggml_nbytes(weight->tensor) });
         }
     }
 
@@ -1895,19 +1941,15 @@ bool llama_model_loader::load_all_data(
     // size and allocate one CPU buffer lazily on first use.
     size_t k9_total = 0;
     size_t k9_max = 0;
-    if (!k9_meta.empty()) {
-        for (ggml_tensor * t : tensors) {
-            const auto * w = get_weight(ggml_get_name(t));
-            if (w && w->tensor->type == GGML_TYPE_K9) {
-                const size_t nb = ggml_nbytes(t);
-                k9_total += nb;
-                k9_max = std::max(k9_max, nb);
-            }
-        }
-        // v3 M2.5/M3: the NORESERVE region must exist before any K9 tensor
-        // is homed (and before the scheduler's first reserve).
-        if (k9_residency::active()) {
-            k9_residency::get().prepare_region(k9_total);
+    // eager-fallback sizing: the k9_buf holds the MATERIALIZED tensors of
+    // THIS context (the residency region — mapped early by
+    // k9_prepare_residency() — is the M3 path)
+    for (ggml_tensor * t : tensors) {
+        const auto * w = get_weight(ggml_get_name(t));
+        if (w && w->tensor->type == GGML_TYPE_K9) {
+            const size_t nb = ggml_nbytes(t);
+            k9_total += nb;
+            k9_max = std::max(k9_max, nb);
         }
     }
     ggml_backend_buffer_t k9_buf = nullptr;
@@ -2016,6 +2058,10 @@ bool llama_model_loader::load_all_data(
                     k9_buf = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), k9_total);
                     ggml_backend_buffer_set_usage(k9_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
                 }
+                if (getenv("K9_RESIDENT_DEBUG")) {
+                    LLAMA_LOG_ERROR("k9 debug: k9buf-alloc %s used=%.2f MiB n=%.2f MiB\n",
+                                    ggml_get_name(cur), k9_used / 1048576.0, n_size / 1048576.0);
+                }
                 ggml_backend_tensor_alloc(k9_buf, cur,
                         (uint8_t *) ggml_backend_buffer_get_base(k9_buf) + k9_used);
                 k9_used += n_size;
@@ -2047,8 +2093,17 @@ bool llama_model_loader::load_all_data(
                 }));
             }
 
+            if (!(buf_mmap || cur->data)) {
+                LLAMA_LOG_ERROR("k9 debug: from_mapping assert for %s (type=%s, buffer=%p, data=%p)\n",
+                                ggml_get_name(cur), ggml_type_name(cur->type), (void *) cur->buffer, cur->data);
+            }
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
+                if (getenv("K9_RESIDENT_DEBUG")) {
+                    LLAMA_LOG_ERROR("k9 debug: fm-alloc %s off=%.2f MiB n=%.2f MiB bufsz=%.2f MiB\n",
+                                    ggml_get_name(cur), weight->offs / 1048576.0, n_size / 1048576.0,
+                                    ggml_backend_buffer_get_size(buf_mmap) / 1048576.0);
+                }
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
 
                 // locking a lazy tensor would fault all of it in, which is what lazy avoids

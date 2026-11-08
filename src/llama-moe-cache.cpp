@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "k9-moe-hook.h"
 
 #include "llama-impl.h"
 #include "llama-memory.h"
@@ -572,11 +573,28 @@ struct llama_moe_cache::impl {
         }
 
         // upload the missing experts, consecutive experts going to consecutive slots are uploaded together
+        // K9 (fork): decode the selected experts' pages into their residency
+        // region first — the upload reads the bytes from the region (docs/13 §2.6)
+        std::vector<int32_t> fill_ids;
+        fill_ids.reserve(fills.size());
+        for (const auto & f : fills) {
+            fill_ids.push_back(f.expert);
+        }
         size_t bytes = 0;
         for (size_t ip = 0; ip < l.experts.size(); ++ip) {
             const ggml_tensor * w    = l.experts[ip];
             ggml_tensor       * bank = g.banks[ip];
             const size_t expert_size = w->nb[2];
+            k9_res_moe_ensure_experts(w, fill_ids.data(), fill_ids.size());
+            if (getenv("K9_RESIDENT_DEBUG") && ip == 0) {
+                uint64_t h = 1469598103934665603ull;
+                const unsigned char * p2 = (const unsigned char *) w->data + fills[0].expert*expert_size;
+                for (size_t b = 0; b < 4096 && b < expert_size; b++) {
+                    h = (h ^ p2[b]) * 1099511628211ull;
+                }
+                LLAMA_LOG_ERROR("k9 debug: upload-src %s expert=%d fnv=%llx\n",
+                                ggml_get_name(w), fills[0].expert, (unsigned long long) h);
+            }
             for (size_t i = 0; i < fills.size();) {
                 size_t n = 1;
                 while (i + n < fills.size() && fills[i + n].expert == fills[i].expert + (int32_t) n && fills[i + n].slot == fills[i].slot + (int32_t) n) {

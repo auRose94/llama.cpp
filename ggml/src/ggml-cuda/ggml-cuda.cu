@@ -1824,6 +1824,17 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
                                           const ggml_tensor * ffn_gate_bias = nullptr,
                                           const ggml_tensor * ffn_up_scale = nullptr,
                                           const ggml_tensor * ffn_gate_scale = nullptr) {
+    // K9 (fork): fused units bypass ggml_cuda_mul_mat_id, so the paged-MoE
+    // hook never decodes the selected experts — unfuse for managed tensors.
+    // The check must look at the WEIGHT tensors (src[0] of each mul_mat_id
+    // node): the NODES have graph-label names (ffn_moe_*) that never match
+    // the registry (docs/13 §2.6)
+    if (ffn_up->src[0] && k9_res_moe_is_managed(ffn_up->src[0])) {
+        return false;
+    }
+    if (ffn_gate->src[0] && k9_res_moe_is_managed(ffn_gate->src[0])) {
+        return false;
+    }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
     const bool has_scale = ffn_up_scale != nullptr || ffn_gate_scale != nullptr;
 

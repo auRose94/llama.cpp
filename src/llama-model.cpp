@@ -7,6 +7,7 @@
 #include "llama-mmap.h"
 #include "llama-cparams.h"
 #include "llama-model-loader.h"
+#include "k9-residency.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1905,6 +1906,11 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
+    // K9 M3 (docs/13 §2.6): map the residency region ONCE with the full K9
+    // tensor set (all contexts) BEFORE buffer creation — per-ctx load_all_data
+    // calls would undersize it
+    ml.k9_prepare_residency();
+
     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
@@ -1945,7 +1951,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        // K9 M3 (docs/13 §2.6): residency-managed contexts get dummy buffers
+        // (same mechanism as no_alloc) — the tensors are homed into the
+        // residency region during load instead
+        const bool is_k9_resident = ctx_key.k9 && k9_residency::active();
+        LLAMA_LOG_WARN("k9 debug: create_buffers ctx k9=%d first=%s path=%s\n",
+                       (int) ctx_key.k9, ggml_get_name(ggml_get_first_tensor(ctx)),
+                       is_k9_resident ? "dummy" : (is_lazy_mapped ? "lazy" : ((ml.use_mmap && use_mmap_buffer && is_default_buft) ? "from_ptr" : "alloc")));
+
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && !is_k9_resident) {
             GGML_ASSERT(!ml.no_alloc);
             const size_t max_size = ggml_get_max_tensor_size(ctx);
 
@@ -1963,12 +1977,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     if (buf == nullptr) {
                         throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
                     }
+                    LLAMA_LOG_WARN("k9 debug: from_ptr buf base=%p size=%.2f MiB (range %.2f-%.2f MiB)\n",
+                                   ggml_backend_buffer_get_base(buf), (range.last - range.first) / 1048576.0,
+                                   range.first / 1048576.0, range.last / 1048576.0);
                     bufs.emplace_back(buf);
                 }
             }
         } else {
             ggml_backend_buffer_t buf;
-            if (ml.no_alloc) {
+            if (ml.no_alloc || is_k9_resident) {
                 buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0); // dummy buffer
                 for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them

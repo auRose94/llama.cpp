@@ -40,6 +40,10 @@ class k9_residency {
 public:
     static bool active();
     static void disable();   // fall back to eager decode-on-load for the rest of this load
+    // Clear ALL state including a sticky disable() from a previous load
+    // (e.g. the fit pass, which loads with LOAD_MODE_NONE). Call at the
+    // start of every real model load.
+    static void fresh_load();
     static k9_residency & get();
 
     // Drop all state (call before a fresh model load in the same process).
@@ -71,11 +75,18 @@ public:
     void moe_ensure_ids(const struct ggml_tensor * weights,
                         const int32_t * idata, int64_t n_used, int64_t n_tok);
 
+    // M3 hook, MoE-cache flavor: decode the lanes covering the given expert
+    // ids of one managed tensor (called before the cache uploads bytes).
+    void moe_ensure_experts(const struct ggml_tensor * weights,
+                            const int32_t * experts, size_t n);
+
     // registry membership check for the C managed-check (no decode)
     bool is_managed(std::string_view name) const {
         auto it = by_name.find(name);
         return it != by_name.end() && it->second.in_arena && it->second.moe;
     }
+    size_t registry_size() const { return by_name.size(); }
+    bool region_ready() const { return region != nullptr; }
 
 private:
     k9_residency() = default;

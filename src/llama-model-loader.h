@@ -141,6 +141,11 @@ struct llama_model_loader {
     // parse the ninths/k9 directory KV if present (no-op for regular GGUF models)
     void k9_load_meta();
 
+    // K9 M3 (docs/13 §2.6): map the residency region sized to ALL K9 tensors
+    // in the created contexts. Call once after create_tensors, before buffer
+    // creation/load. No-op when residency is inactive or already prepared.
+    void k9_prepare_residency();
+
     gguf_context_ptr metadata_ptr;
     struct gguf_context * metadata; // either metadata_ptr.get() or externally set
     llama_model_set_tensor_data_t set_tensor_data;
@@ -165,12 +170,18 @@ struct llama_model_loader {
     struct ctx_key {
         ggml_backend_buffer_type_t buft;
         bool lazy;
+        bool k9 = false; // K9 residency: dedicated ctx so the model-buffer
+                         // creation can dummy-buffer them and the residency
+                         // region can home them (docs/13 §2.6 M3)
     };
 
     struct ctx_key_comparator {
         bool operator()(const ctx_key & lhs, const ctx_key & rhs) const {
             if (lhs.lazy != rhs.lazy) {
                 return lhs.lazy < rhs.lazy;
+            }
+            if (lhs.k9 != rhs.k9) {
+                return lhs.k9 < rhs.k9;
             }
             return strcmp(ggml_backend_buft_name(lhs.buft), ggml_backend_buft_name(rhs.buft)) < 0;
         }

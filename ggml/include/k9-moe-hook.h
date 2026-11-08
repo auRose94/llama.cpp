@@ -34,6 +34,12 @@ bool k9_res_moe_ensure(const struct ggml_tensor * weights,
 void k9_res_moe_ensure_ids(const struct ggml_tensor * weights,
                            const int32_t * ids, int64_t n_used, int64_t n_tok);
 
+// Decode the lanes covering the given expert ids of a K9 paged MoE tensor
+// into its residency region (no-op for non-managed tensors). Used by the
+// MoE cache upload path before it copies expert bytes host→device.
+void k9_res_moe_ensure_experts(const struct ggml_tensor * weights,
+                               const int32_t * experts, size_t n);
+
 // HIP region registration: makes a host mapping device-readable (HMM on
 // APUs — the probe in docs/13 §2.6). CPU builds: returns false.
 bool k9_res_hip_register(void * ptr, size_t size);

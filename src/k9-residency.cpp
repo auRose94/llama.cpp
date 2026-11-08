@@ -82,6 +82,12 @@ void k9_residency::disable() {
     g_killed = true;
 }
 
+void k9_residency::fresh_load() {
+    g_killed = false; // a previous load's disable (fit pass: LOAD_MODE_NONE)
+                      // must not poison this load
+    get().reset();
+}
+
 k9_residency & k9_residency::get() {
     static k9_residency inst;
     return inst;
@@ -125,23 +131,14 @@ void k9_residency::prepare_region(size_t total) {
             "k9 residency: failed to map the %.2f GiB NORESERVE region",
             total / 1073741824.0));
     }
-#ifdef K9_RES_HIP
-    // M3-HIP: register the mapping so HIP kernels can fault the pages
-    // (HMM on APUs — probe in docs/13 §2.6). The buffer wraps the region
-    // with the HIP buffer type so the scheduler routes K9-tensor ops to
-    // the GPU; kernels dereference the host pointers directly.
-    if (k9_res_hip_register(region, total)) {
-        buf = k9_res_hip_region_buffer(region, total, k9_res_hip_primary_device());
-        if (buf) {
-            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-            LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE, HIP-registered)%s\n",
-                           total / 1073741824.0,
-                           budget ? format(", expert-page budget %.2f GiB", budget / 1073741824.0).c_str() : "");
-            return;
-        }
-        k9_res_hip_unregister(region); // buffer wrap failed — plain CPU path
-    }
-#endif
+    // M3-HIP finding: a HIP-registered region is NOT viable — kernels
+    // overread tile-aligned neighbor pages (HMM zero-fault), and once the
+    // GPU has mapped an undecoded page it never sees the host's later
+    // decode writes (stale IOMMU state). The correct HIP architecture is
+    // the MoE cache: the region stays CPU-resident (this CPU buffer), the
+    // MoE cache uploads selected experts to device banks per token
+    // (llama-moe-cache.cpp + k9_res_moe_ensure_experts), and the GPU
+    // matmuls read the banks. Enabled with --moe-cache-mib.
     buf = ggml_backend_cpu_buffer_from_ptr(region, total);
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
     LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE, CPU buffer)%s\n",
@@ -150,9 +147,13 @@ void k9_residency::prepare_region(size_t total) {
 }
 
 bool k9_residency::home_fixed(struct ggml_tensor * cur, size_t offset) {
-    if (cur->data != nullptr || cur->buffer != nullptr) {
-        return false; // homed elsewhere — caller decodes eagerly
+    if (cur->data != nullptr) {
+        return false; // real data elsewhere — caller decodes eagerly
     }
+    // the tensor may carry a DUMMY buffer (create_buffers marks K9-resident
+    // tensors this way so the scheduler won't allocate them) — clearing it
+    // is safe: the region buffer replaces it as the tensor's home
+    cur->buffer = nullptr;
     ggml_backend_tensor_alloc(buf, cur, (uint8_t *) region + offset);
     return true;
 }
@@ -236,8 +237,14 @@ bool k9_residency::ensure_page(entry & e, uint32_t p) {
                                         e.meta.name.c_str(), err.c_str()));
     }
     e.page_dec[p >> 6] |= (uint64_t)(1ull << (p & 63));
-    if (env_flag("K9_RESIDENT_DEBUG") && !((e.page_dec[p >> 6] >> (p & 63)) & 1)) {
-        LLAMA_LOG_WARN("k9 residency: BIT DID NOT STICK %s page %u\n", e.meta.name.c_str(), p);
+    if (env_flag("K9_RESIDENT_DEBUG")) {
+        uint64_t h = 1469598103934665603ull;
+        const unsigned char * pp = (const unsigned char *) region + page_off(e, p);
+        for (size_t b = 0; b < 4096 && b < sz; b++) {
+            h = (h ^ pp[b]) * 1099511628211ull;
+        }
+        LLAMA_LOG_WARN("k9 residency: decoded %s page %u fnv=%llx (moedec=%.1f MiB)\n",
+                       e.meta.name.c_str(), p, (unsigned long long) h, moe_decoded / 1048576.0);
     }
     e.page_stamp[p] = (uint32_t) ++clock;
     moe_decoded += sz;
@@ -417,6 +424,20 @@ void k9_residency::moe_ensure_ids(const struct ggml_tensor * weights,
     }
 }
 
+void k9_residency::moe_ensure_experts(const struct ggml_tensor * weights,
+                                      const int32_t * experts, size_t n) {
+    const char * nm = ggml_get_name(weights);
+    if (!nm || !nm[0]) {
+        return;
+    }
+    auto it = by_name.find(std::string_view(nm));
+    if (it == by_name.end() || !it->second.in_arena || !it->second.moe) {
+        return;
+    }
+    // reuse the reservation pipeline: the expert list is the id payload
+    moe_ensure_ids(weights, experts, (int64_t) n, 1);
+}
+
 void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
     if (by_name.empty() || gf == nullptr) {
         return;
@@ -503,7 +524,14 @@ bool k9_res_moe_is_managed(const struct ggml_tensor * weights) {
     if (!nm || !nm[0]) {
         return false;
     }
-    return k9_residency::get().is_managed(std::string_view(nm));
+    const bool r = k9_residency::get().is_managed(std::string_view(nm));
+    static int dbg = 0;
+    if (dbg < 6) {
+        dbg++;
+        LLAMA_LOG_ERROR("k9 debug: is_managed(%s) = %d (registry %zu)\n", nm, (int) r,
+                        k9_residency::get().registry_size());
+    }
+    return r;
 }
 
 bool k9_res_moe_ensure(const struct ggml_tensor * weights, const struct ggml_tensor * ids) {
@@ -516,6 +544,28 @@ bool k9_res_moe_ensure(const struct ggml_tensor * weights, const struct ggml_ten
         LLAMA_LOG_ERROR("k9 residency: moe_ensure failed: %s\n", e.what());
     } catch (...) {
         LLAMA_LOG_ERROR("k9 residency: moe_ensure failed (unknown exception)\n");
+    }
+    abort();
+}
+
+// C hook, MoE-cache flavor: decode the lanes covering the given expert ids
+// of one managed tensor (the cache upload calls this before copying bytes
+// host→device). Same no-exceptions contract.
+void k9_res_moe_ensure_experts(const struct ggml_tensor * weights, const int32_t * experts, size_t n) {
+    if (!k9_residency::active() || n == 0) {
+        return;
+    }
+    const char * nm = ggml_get_name(weights);
+    if (!nm || !nm[0]) {
+        return;
+    }
+    try {
+        k9_residency::get().moe_ensure_experts(weights, experts, n);
+        return;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure_experts failed: %s\n", e.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure_experts failed (unknown exception)\n");
     }
     abort();
 }
