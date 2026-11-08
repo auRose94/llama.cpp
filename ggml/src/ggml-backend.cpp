@@ -1901,6 +1901,30 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            // k9 debug: tap per-split outputs by name (K9_TAP=substring)
+            if (getenv("K9_TAP")) {
+                static const char * k9_filter = getenv("K9_TAP");
+                static int k9_tap_n = 0;
+                for (int k9_i = ggml_graph_n_nodes(&split->graph) - 1; k9_i >= 0; k9_i--) {
+                    ggml_tensor * k9_t = ggml_graph_node(&split->graph, k9_i);
+                    if (k9_t && k9_t->name && strstr(k9_t->name, k9_filter)) {
+                        if (k9_tap_n < 40) {
+                            k9_tap_n++;
+                            static std::vector<uint8_t> k9_buf;
+                            const size_t k9_nb = ggml_nbytes(k9_t);
+                            if (k9_buf.size() < k9_nb) k9_buf.resize(k9_nb);
+                            ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
+                            unsigned long long k9_h = 1469598103934665603ull;
+                            for (size_t k9_b = 0; k9_b < k9_nb && k9_b < 32768; k9_b++) {
+                                k9_h = (k9_h ^ k9_buf[k9_b]) * 1099511628211ull;
+                            }
+                            GGML_LOG_ERROR("k9 tap: %s [%s] fnv=%llx (%.1f KB)\n",
+                                           k9_t->name, ggml_backend_name(split_backend), k9_h, k9_nb/1024.0);
+                        }
+                        break;
+                    }
+                }
+            }
         } else {
             // similar to ggml_backend_compare_graph_backend
             for (int j0 = 0; j0 < split->graph.n_nodes; j0++) {
@@ -2247,9 +2271,10 @@ enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor) {
 
 enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr) {
     GGML_ASSERT(tensor);
-    GGML_ASSERT(tensor->buffer == NULL);
-    GGML_ASSERT(tensor->data == NULL);
-    GGML_ASSERT(tensor->view_src == NULL);
+    if (tensor->buffer || tensor->data || tensor->view_src) { // k9 debug: name the offender instead of a bare assert
+        GGML_ABORT("ggml_backend_tensor_alloc: tensor '%s' buffer=%p data=%p view_src=%p",
+                   ggml_get_name(tensor), (void *) tensor->buffer, tensor->data, (void *) tensor->view_src);
+    }
     GGML_ASSERT(addr >= ggml_backend_buffer_get_base(buffer));
     GGML_ASSERT(ggml_backend_buffer_is_meta(buffer) ||
         (char *) addr + ggml_backend_buffer_get_alloc_size(buffer, tensor) <=

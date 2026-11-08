@@ -31,6 +31,15 @@ void llama_model_loader::k9_prepare_residency() {
     if (!k9_residency::active()) {
         return;
     }
+    if (!use_mmap) {
+        // residency needs the blob pointers to outlive the loader — decide
+        // here (before buffer creation) so the K9 ctxs allocate real
+        // buffers and the eager decode-on-load path works; disabling
+        // mid-load would crash on the dummy-buffered K9 ctxs
+        LLAMA_LOG_WARN("k9 residency: no mmap — falling back to eager decode-on-load\n");
+        k9_residency::disable();
+        return;
+    }
     size_t total = 0;
     int n_k9_ctxs = 0, n_other_ctxs = 0;
     for (const auto & [key, ctx] : ctx_map) {

@@ -1600,9 +1600,50 @@ static void ggml_compute_forward_mul_mat_id(
     // barrier before the kernel reads them (docs/13 §2.6). The managed
     // check runs on every thread so the barrier is uniform; the decode is
     // thread-0 only — concurrent calls race the registry state.
+    static const struct ggml_tensor * k9_prev_dst = NULL;
+    static unsigned long long k9_prev_hash = 0;
+    if (k9_prev_dst != NULL && getenv("K9_RESIDENT_DEBUG")) {
+        static int k9_pd_dbg = 0;
+        if (k9_pd_dbg < 6) {
+            k9_pd_dbg++;
+            unsigned long long k9_h = 1469598103934665603ull;
+            const unsigned char * k9_p = (const unsigned char *) k9_prev_dst->data;
+            const size_t k9_n = (size_t) ggml_nbytes(k9_prev_dst);
+            for (size_t k9_b = 0; k9_b < k9_n && k9_b < 65536; k9_b++) {
+                k9_h = (k9_h ^ k9_p[k9_b]) * 1099511628211ull;
+            }
+            fprintf(stderr, "k9 debug: prev-dst %s fnv=%llx\n", k9_prev_dst->name, k9_h);
+        }
+    }
+    k9_prev_dst = dst;
     if (k9_res_moe_is_managed(src0)) {
         if (params->ith == 0) {
             k9_res_moe_ensure(src0, ids);
+            if (getenv("K9_RESIDENT_DEBUG")) {
+                static int k9_id_dbg = 0;
+                k9_id_dbg++;
+                if (k9_id_dbg >= 49 && k9_id_dbg <= 51) {
+                    {
+                        const int32_t * k9_idv = (const int32_t *) ids->data;
+                        fprintf(stderr, "k9 debug: post-decode region %s e0=%d reg_fnv=%llx src1=%p nb=%lld,%lld ne=%lld,%lld\n",
+                                src0->name, k9_idv[0],
+                                k9_res_debug_expert_fnv(src0->name, k9_idv[0]),
+                                src1->data,
+                                (long long) src1->nb[1], (long long) src1->nb[2],
+                                (long long) src1->ne[1], (long long) src1->ne[2]);
+                    }
+                    const int32_t * k9_id = (const int32_t *) ids->data;
+                    unsigned long long k9_ha = 1469598103934665603ull;
+                    const unsigned char * k9_a = (const unsigned char *) src1->data;
+                    for (size_t k9_b = 0; k9_b < 4096; k9_b++) {
+                        k9_ha = (k9_ha ^ k9_a[k9_b]) * 1099511628211ull;
+                    }
+                    fprintf(stderr, "k9 debug: cpu ids %s act_fnv=%llx: %d %d %d %d %d %d %d %d\n",
+                            src0->name, k9_ha,
+                            k9_id[0], k9_id[1], k9_id[2], k9_id[3],
+                            k9_id[4], k9_id[5], k9_id[6], k9_id[7]);
+                }
+            }
         }
         ggml_barrier(params->threadpool);
     }

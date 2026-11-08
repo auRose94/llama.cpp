@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "k9-moe-hook.h"
 #include "k9-residency.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -2777,6 +2778,72 @@ ggml_status llama_context::graph_compute(
     // tensors. Cheap no-op when K9_RESIDENT is off (nothing registered).
     k9_residency::get().ensure_graph(gf);
 
+    // k9 debug: print the placement predicates for the two CPU-side buffer types
+    if (getenv("K9_RESIDENT_DEBUG") && !backends.empty() && gf && ggml_graph_n_nodes(gf) > 0) {
+        static bool k9_buft_dbg = false;
+        if (!k9_buft_dbg) {
+            k9_buft_dbg = true;
+            ggml_backend_t k9_gpu = nullptr;
+            for (const auto & b : backends) {
+                if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    k9_gpu = b.get();
+                    break;
+                }
+            }
+            if (k9_gpu) {
+                ggml_backend_buffer_t k9_region_buf = k9_residency::get().region_buffer();
+                // find any two weight buffers in the graph
+                ggml_backend_buffer_type_t k9_bt_region = k9_region_buf ? ggml_backend_buffer_get_type(k9_region_buf) : nullptr;
+                for (int i = 0; i < ggml_graph_n_nodes(gf) && k9_bt_region == nullptr; i++) {
+                    ggml_tensor * node = ggml_graph_node(gf, i);
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (node->src[j] && node->src[j]->buffer) {
+                            k9_bt_region = ggml_backend_buffer_get_type(node->src[j]->buffer);
+                            i = ggml_graph_n_nodes(gf);
+                            break;
+                        }
+                    }
+                }
+                ggml_backend_buffer_type_t k9_bt_cpu = ggml_backend_cpu_buffer_type();
+                LLAMA_LOG_ERROR("k9 debug: buft region=%s cpu=%s | hip_sup(region)=%d hip_sup(cpu)=%d cpu_sup(region)=%d\n",
+                               k9_bt_region ? ggml_backend_buft_name(k9_bt_region) : "(null)",
+                               ggml_backend_buft_name(k9_bt_cpu),
+                               k9_bt_region ? (int) ggml_backend_supports_buft(k9_gpu, k9_bt_region) : -1,
+                               (int) ggml_backend_supports_buft(k9_gpu, k9_bt_cpu),
+                               k9_bt_region ? (int) ggml_backend_supports_buft(backend_cpu, k9_bt_region) : -1);
+            }
+        }
+    }
+
+    // K9 debug (K9_RES_GPU_WEIGHTS=1): user-assign the region-homed tensors
+    // to the FIRST backend (highest prio, GPU) — reproduces the eager path's
+    // "4.cur" outcome: the scheduler then keeps the whole graph in one GPU
+    // split and the kernels read the region host pointers directly (the
+    // integrated GPU's HMM tracks anon-mmap pages via mmu-notifiers; the
+    // retired finding concerned a hipHostRegister'd region).
+    if (k9_residency::get().active() && getenv("K9_RES_GPU_WEIGHTS")) {
+        ggml_backend_buffer_t k9_region_buf = k9_residency::get().region_buffer();
+        ggml_backend_t k9_gpu = nullptr;
+        for (const auto & b : backends) {
+            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                k9_gpu = b.get();
+                break;
+            }
+        }
+        if (k9_region_buf != nullptr && k9_gpu != nullptr) {
+            const int n = ggml_graph_n_nodes(gf);
+            for (int i = 0; i < n; i++) {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    ggml_tensor * src = node->src[j];
+                    if (src != nullptr && src->buffer == k9_region_buf) {
+                        ggml_backend_sched_set_tensor_backend(sched.get(), src, k9_gpu);
+                    }
+                }
+            }
+        }
+    }
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2803,6 +2870,21 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
     if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+        // K9 (fork): the weight is a paged tensor crossing in a GENERIC
+        // split copy (the split starts at another op, e.g. the layer's
+        // first matmul). The scheduler copies the whole tensor right after
+        // this callback returns false — decode it wholly here, or the copy
+        // sweeps undecoded (zero) region pages into the device buffer
+        // (docs/13 §2.6 M3-HIP). Idempotent: already-decoded lanes are
+        // kept; with a budget this evicts other tensors' pages first.
+        if (k9_res_moe_is_managed(src)) {
+            const int64_t n_exp_all = src->ne[2];
+            std::vector<int32_t> all_ids((size_t) n_exp_all);
+            for (int64_t e = 0; e < n_exp_all; e++) {
+                all_ids[(size_t) e] = (int32_t) e;
+            }
+            k9_res_moe_ensure_experts(src, all_ids.data(), all_ids.size());
+        }
         return false;
     }
 
@@ -2829,6 +2911,27 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         st.ids = ids;
+    }
+
+    // K9 (fork): paged experts hold real bytes only where the residency hook
+    // decoded them — the region's undecoded pages read as zeros (docs/13
+    // §2.6 M3-HIP). The MoE-cache leg decodes in its own copy(); this
+    // fallback leg owns the uploads whenever the slot-map path is disabled
+    // (cache off, budget too small, or prefill batches above its
+    // max_batch), so decode the used experts before any byte crosses
+    // host->device. Runs host-side (no graph threads active here), no-op
+    // for non-K9 and eager-mode weights.
+    if (k9_res_moe_is_managed(src)) {
+        std::vector<int32_t> used_ids;
+        used_ids.reserve((size_t) n_expert);
+        for (int64_t e = 0; e < n_expert; e++) {
+            if (st.used[e]) {
+                used_ids.push_back((int32_t) e);
+            }
+        }
+        if (!used_ids.empty()) {
+            k9_res_moe_ensure_experts(src, used_ids.data(), used_ids.size());
+        }
     }
 
     // group consecutive experts and copy them together
@@ -2866,6 +2969,23 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         }
 
         first = last + 1;
+    }
+
+    // K9 debug: read back the first uploaded expert from the device and
+    // FNV-compare against the region source (verifies region→device bytes)
+    if (getenv("K9_RESIDENT_DEBUG") && k9_res_moe_is_managed(src)) {
+        static int up_dbg = 0;
+        if (up_dbg < 8) {
+            up_dbg++;
+            std::vector<uint8_t> dev(expert_size);
+            ggml_backend_tensor_get(dst, dev.data(), 0, expert_size);
+            uint64_t hd = 1469598103934665603ull;
+            for (size_t b = 0; b < 4096 && b < dev.size(); b++) {
+                hd = (hd ^ dev[b]) * 1099511628211ull;
+            }
+            LLAMA_LOG_ERROR("k9 debug: upload-check %s slot0_dev_fnv=%llx\n",
+                            ggml_get_name(src), (unsigned long long) hd);
+        }
     }
 
     return true;

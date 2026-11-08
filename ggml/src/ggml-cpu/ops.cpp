@@ -5439,6 +5439,22 @@ void ggml_compute_forward_get_rows(
     //    printf("\n");
     //    exit(0);
     //}
+
+    // k9 debug: hash the first embedding-table lookups (earliest activation)
+    if (getenv("K9_RESIDENT_DEBUG") && src0->ne[1] > 1024) {
+        static int k9_gr_dbg = 0;
+        if (k9_gr_dbg < 3) {
+            k9_gr_dbg++;
+            unsigned long long k9_h = 1469598103934665603ull;
+            const unsigned char * k9_p = (const unsigned char *) dst->data;
+            const size_t k9_n = (size_t) ggml_nbytes(dst);
+            for (size_t k9_b = 0; k9_b < k9_n && k9_b < 65536; k9_b++) {
+                k9_h = (k9_h ^ k9_p[k9_b]) * 1099511628211ull;
+            }
+            GGML_LOG_ERROR("k9 debug: get-rows %s ne=%dx%d fnv=%llx\n",
+                            dst->name, (int) dst->ne[0], (int) dst->ne[1], k9_h);
+        }
+    }
 }
 
 template<typename src_t, typename idx_t>

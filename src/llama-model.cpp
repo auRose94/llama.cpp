@@ -1607,12 +1607,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
-        for (const auto & dev : devices) {
-            ggml_backend_dev_props props;
-            ggml_backend_dev_get_props(dev.dev, &props);
-            if (!props.caps.mmap_support) {
-                ml.use_mmap = false;
-                break;
+        // K9 (fork): a paged container's residency REQUIRES file mmap (the
+        // blob pointers must outlive the loader) — and file mmap is
+        // independent of the device host-ptr capability this upstream rule
+        // targets (#28160: the from_ptr buffer path checks
+        // buffer_from_host_ptr separately). Exempt K9 stream models so
+        // residency stays reachable on iGPUs (docs/13 §2.6 M3-HIP).
+        if (ml.k9_meta.empty() && ml.k9_pages.empty()) {
+            for (const auto & dev : devices) {
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev.dev, &props);
+                if (!props.caps.mmap_support) {
+                    ml.use_mmap = false;
+                    break;
+                }
             }
         }
     }

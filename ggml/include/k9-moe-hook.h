@@ -52,6 +52,17 @@ int k9_res_hip_primary_device(void);
 // residency registry (the buffer's free is a no-op).
 ggml_backend_buffer_t k9_res_hip_region_buffer(void * host_ptr, size_t size, int device);
 
+
+// True when K9 residency is active (K9_RESIDENT=1 and a region is mapped).
+// Graph-capture decisions must consult this: replayed graphs skip the
+// host-side decode hooks.
+bool k9_residency_is_active(void);
+
+// k9 debug: FNV(4096) of `expert`'s bytes of the managed tensor `name` in
+// the residency region (decode-on-demand NOT triggered). Returns 0 when
+// unknown.
+unsigned long long k9_res_debug_expert_fnv(const char * name, int32_t expert);
+
 #ifdef __cplusplus
 }
 #endif

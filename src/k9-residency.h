@@ -86,6 +86,10 @@ public:
         return it != by_name.end() && it->second.in_arena && it->second.moe;
     }
     size_t registry_size() const { return by_name.size(); }
+    // the region's buffer (for scheduler-level checks); null before prepare_region
+    ggml_backend_buffer_t region_buffer() const { return buf; }
+    // k9 debug: FNV(4096) of an expert's bytes in the region (no decode)
+    unsigned long long debug_expert_fnv(std::string_view name, int32_t expert) const;
     bool region_ready() const { return region != nullptr; }
 
 private:

@@ -2093,6 +2093,30 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // k9 debug: sample the first dense quantized weight the kernel reads
+    if (getenv("K9_RESIDENT_DEBUG") && src0 && src0->type == GGML_TYPE_Q8_0 &&
+        ggml_nbytes(src0) > (int64_t) 1 << 20 && src1->ne[1] > 1) {
+        static int k9d_dbg = 0;
+        if (k9d_dbg < 4) {
+            k9d_dbg++;
+            CUDA_CHECK(hipDeviceSynchronize());
+            std::vector<uint8_t> k9_dev(4096);
+            CUDA_CHECK(hipMemcpy(k9_dev.data(), src0->data, 4096, hipMemcpyDeviceToHost));
+            unsigned long long k9_h = 1469598103934665603ull;
+            for (size_t k9_b = 0; k9_b < 4096; k9_b++) {
+                k9_h = (k9_h ^ k9_dev[k9_b]) * 1099511628211ull;
+            }
+            std::string k9_nm = src0->name;
+            const size_t k9_p1 = k9_nm.find('#');
+            const size_t k9_p2 = k9_nm.rfind('#');
+            if (k9_p1 != std::string::npos && k9_p2 != k9_p1) {
+                k9_nm = k9_nm.substr(k9_p1 + 1, k9_p2 - k9_p1 - 1);
+            }
+            GGML_LOG_ERROR("k9 debug: dense-read %s dev_fnv=%llx reg_fnv=%llx\n",
+                           src0->name, k9_h, k9_res_debug_expert_fnv(k9_nm.c_str(), -1));
+        }
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
@@ -2190,6 +2214,53 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // out, decode on the host (into the registered region — kernels read it
     // via HMM), then launch (docs/13 §2.6). The per-layer sync stalls the
     // pipeline; the host decode dominates batch-1 pacing anyway.
+    // k9 debug: what the kernel is about to read for its first expert
+    // (unconditional under the debug env — the sched's input copies do not
+    // carry the K9 name, so the managed branch alone never samples them)
+    if (getenv("K9_RESIDENT_DEBUG") && ggml_nbytes(ids) >= (int64_t) sizeof(int32_t) && ggml_is_quantized(src0->type) && src0->ne[2] > 1) {
+        static int krn_dbg = 0;
+        krn_dbg++;
+        if ((krn_dbg >= 3 && krn_dbg <= 14) || (krn_dbg % 91 == 1 && krn_dbg < 3640)) {
+            CUDA_CHECK(hipDeviceSynchronize());
+            int32_t k9_e0 = 0;
+            CUDA_CHECK(hipMemcpy(&k9_e0, ids->data, sizeof(int32_t), hipMemcpyDeviceToHost));
+            if (k9_e0 >= 0 && k9_e0 < src0->ne[2]) {
+                const size_t k9_esz = (size_t) src0->nb[2];
+                std::vector<uint8_t> k9_dev(k9_esz);
+                CUDA_CHECK(hipMemcpy(k9_dev.data(), (const uint8_t *) src0->data + (size_t) k9_e0 * k9_esz,
+                                     k9_esz, hipMemcpyDeviceToHost));
+                unsigned long long k9_h = 1469598103934665603ull;
+                for (size_t k9_b = 0; k9_b < 4096 && k9_b < k9_dev.size(); k9_b++) {
+                    k9_h = (k9_h ^ k9_dev[k9_b]) * 1099511628211ull;
+                }
+                std::string k9_nm = src0->name;
+                const size_t k9_p1 = k9_nm.find('#');
+                const size_t k9_p2 = k9_nm.rfind('#');
+                if (k9_p1 != std::string::npos && k9_p2 != k9_p1) {
+                    k9_nm = k9_nm.substr(k9_p1 + 1, k9_p2 - k9_p1 - 1);
+                }
+                std::vector<int32_t> k9_ids_all(8, -1);
+                CUDA_CHECK(hipMemcpy(k9_ids_all.data(), ids->data,
+                                     std::min<size_t>(8, (size_t)(ids->ne[0]*ids->ne[1])) * sizeof(int32_t),
+                                     hipMemcpyDeviceToHost));
+                // hash the activation input (src1) too: the first 4096 bytes
+                std::vector<uint8_t> k9_a1(4096);
+                CUDA_CHECK(hipMemcpy(k9_a1.data(), src1->data, 4096, hipMemcpyDeviceToHost));
+                unsigned long long k9_ha = 1469598103934665603ull;
+                for (size_t k9_b = 0; k9_b < 4096; k9_b++) {
+                    k9_ha = (k9_ha ^ k9_a1[k9_b]) * 1099511628211ull;
+                }
+                const unsigned long long k9_rg = k9_res_debug_expert_fnv(k9_nm.c_str(), k9_e0);
+                if (k9_rg != 0 && k9_rg != k9_h) {
+                    static int k9_bad = 0;
+                    k9_bad++;
+                    GGML_LOG_ERROR("k9 debug: KERNEL-INPUT MISMATCH #%d call=%d %s e0=%d dev=%llx reg=%llx\n",
+                                   k9_bad, krn_dbg, src0->name, k9_e0, k9_h, k9_rg);
+                }
+            }
+        }
+    }
+
     if (k9_res_moe_is_managed(src0)) {
         CUDA_CHECK(hipDeviceSynchronize());
         const int64_t k9_n_used = ids->ne[0];
@@ -2880,8 +2951,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             }
             // K9 (fork): the paged-MoE hook decodes at enqueue time — graph
             // replays would skip it and run with stale expert pages
-            // (docs/13 §2.6)
-            if (k9_res_moe_is_managed(node->src[0])) {
+            // (docs/13 §2.6). Name-based checks are not enough here: the
+            // scheduler's input copies hide the K9 identity, so while
+            // residency is active we disable capture for any graph
+            // carrying mul_mat_id.
+            if (k9_res_moe_is_managed(node->src[0]) || k9_residency_is_active()) {
                 use_cuda_graph = false;
                 if (ggml_cuda_graph_debug_enabled()) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to K9 paged MoE tensor\n", __func__);

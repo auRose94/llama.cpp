@@ -280,6 +280,30 @@ void k9_residency::moe_ensure_ids(const struct ggml_tensor * weights,
     }
     entry & e = it->second;
     if (env_flag("K9_RESIDENT_DEBUG")) {
+        // pointer audit: does the graph's tensor still point at its
+        // registered region home? (a mismatch means the kernel reads bytes
+        // the hook never wrote)
+        const uint8_t * reg = (const uint8_t *) region + e.region_off;
+        const uint8_t * gph = (const uint8_t *) weights->data;
+        uint64_t hg = 1469598103934665603ull;
+        for (size_t b = 0; b < 4096 && b < e.nbytes; b++) {
+            hg = (hg ^ gph[b]) * 1099511628211ull;
+        }
+        uint64_t hr = 1469598103934665603ull;
+        for (size_t b = 0; b < 4096 && b < e.nbytes; b++) {
+            hr = (hr ^ reg[b]) * 1099511628211ull;
+        }
+        static int ptr_dbg = 0;
+        if (ptr_dbg < 8) {
+            ptr_dbg++;
+            LLAMA_LOG_ERROR("k9 residency: ptr %s reg=%p gph=%p delta=%lld reg_fnv=%llx gph_fnv=%llx buf=%s buft=%s\n",
+                           e.meta.name.c_str(), (void *) reg, (void *) gph,
+                           (long long) (gph - reg), (unsigned long long) hr, (unsigned long long) hg,
+                           weights->buffer ? ggml_backend_buffer_name(weights->buffer) : "(null)",
+                           weights->buffer ? ggml_backend_buft_name(ggml_backend_buffer_get_type(weights->buffer)) : "(null)");
+        }
+    }
+    if (env_flag("K9_RESIDENT_DEBUG")) {
         uint32_t bits = 0;
         for (uint32_t p = 0; p < e.lanes; p++) {
             bits += (uint32_t)((e.page_dec[p >> 6] >> (p & 63)) & 1);
@@ -438,6 +462,26 @@ void k9_residency::moe_ensure_experts(const struct ggml_tensor * weights,
     moe_ensure_ids(weights, experts, (int64_t) n, 1);
 }
 
+unsigned long long k9_residency::debug_expert_fnv(std::string_view name, int32_t expert) const {
+    auto it = by_name.find(name);
+    if (it == by_name.end() || region == nullptr) {
+        return 0;
+    }
+    const entry & e = it->second;
+    if (expert >= 0 && (e.n_exp == 0 || (uint32_t) expert >= e.n_exp)) {
+        return 0;
+    }
+    const size_t expert_rows = e.n_exp > 0 ? e.rows / e.n_exp : e.rows;
+    const size_t off = expert >= 0 ? (size_t) expert * expert_rows * e.row_bytes : 0;
+    const size_t len = expert >= 0 ? expert_rows * e.row_bytes : e.nbytes;
+    const unsigned char * p = (const unsigned char *) region + e.region_off + off;
+    unsigned long long h = 1469598103934665603ull;
+    for (size_t b = 0; b < 4096 && b < len; b++) {
+        h = (h ^ p[b]) * 1099511628211ull;
+    }
+    return h;
+}
+
 void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
     if (by_name.empty() || gf == nullptr) {
         return;
@@ -490,6 +534,14 @@ void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
         LLAMA_LOG_WARN("k9 residency: first ensure_graph: %d nodes, %zu registered, "
                        "%zu matched, %zu distinct\n",
                        n, by_name.size(), matched, distinct);
+        if (env_flag("K9_RESIDENT_DEBUG")) {
+            for (auto & [nm, e] : by_name) {
+                if (!e.in_graph) {
+                    LLAMA_LOG_WARN("k9 residency: NOT in graph: %s (moe=%d)\n",
+                                   nm.c_str(), (int) e.moe);
+                }
+            }
+        }
     }
 
     // fill non-MoE tensors wholly (first use, then resident forever); MoE
@@ -507,6 +559,17 @@ void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
                            (uint8_t *) region + e.region_off, err)) {
             throw std::runtime_error(format("k9 residency: decode of %s failed: %s",
                                             e.meta.name.c_str(), err.c_str()));
+        }
+        if (env_flag("K9_RESIDENT_DEBUG")) {
+            uint64_t h = 1469598103934665603ull;
+            const unsigned char * pp = (const unsigned char *) region + e.region_off;
+            for (size_t b = 0; b < 4096 && b < e.nbytes; b++) {
+                h = (h ^ pp[b]) * 1099511628211ull;
+            }
+            LLAMA_LOG_WARN("k9 residency: filled %s fnv=%llx (off=%.2f MiB, %.2f MiB) buf=%s\n",
+                           e.meta.name.c_str(), (unsigned long long) h,
+                           e.region_off / 1048576.0, e.nbytes / 1048576.0,
+                           e.cur && e.cur->buffer ? ggml_backend_buffer_name(e.cur->buffer) : "(null)");
         }
         e.stamp = ++clock;
         n_mat++;
@@ -586,4 +649,15 @@ void k9_res_moe_ensure_ids(const struct ggml_tensor * weights, const int32_t * i
         LLAMA_LOG_ERROR("k9 residency: moe_ensure_ids failed (unknown exception)\n");
     }
     abort();
+}
+
+bool k9_residency_is_active(void) {
+    return k9_residency::active();
+}
+
+unsigned long long k9_res_debug_expert_fnv(const char * name, int32_t expert) {
+    if (!k9_residency::active() || !name) {
+        return 0;
+    }
+    return k9_residency::get().debug_expert_fnv(name, expert);
 }
