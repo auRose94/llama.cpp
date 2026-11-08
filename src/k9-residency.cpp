@@ -1,6 +1,6 @@
-// v3 residency implementation — see k9-residency.h (docs/13 §2.6, gates 3+).
-// M2.5: real-budget arena — K9 tensors dummy-home at load (poison slab),
-// ensure_graph re-points data into decoded slots, LRU eviction frees them.
+// v3 residency implementation — see k9-residency.h (docs/13 §2.6).
+// M3: MAP_NORESERVE region + lane pages + mul_mat_id hook. Eviction is
+// madvise(MADV_DONTNEED) — the kernel reclaims, so RSS is honest.
 #include "k9-residency.h"
 
 #include <algorithm>
@@ -8,17 +8,15 @@
 #include <cstring>
 #include <functional>
 #include <stdexcept>
+#include <unistd.h>
 
+#include <sys/mman.h>
+
+#include "ggml-backend.h"
+#include "k9-moe-hook.h"
 #include "llama-impl.h"
 
 namespace {
-
-constexpr size_t K9_SLOT_ALIGN  = 64;
-constexpr size_t K9_POISON_SIZE = 1 << 20; // zeroed slab; evicted/dummy tensors point here
-
-size_t round_up(size_t v, size_t a) {
-    return (v + a - 1) / a * a;
-}
 
 bool env_flag(const char * name) {
     const char * v = getenv(name);
@@ -28,6 +26,39 @@ bool env_flag(const char * name) {
 double env_float(const char * name) {
     const char * v = getenv(name);
     return v ? atof(v) : 0.0;
+}
+
+// MADV_DONTNEED with page-aligned ABSOLUTE bounds — raw unaligned calls
+// return EINVAL silently and nothing is ever dropped (the bring-up gotcha:
+// blob pointers start at arbitrary offsets, so aligning an offset from an
+// unaligned base is not enough). inward=true rounds the range IN (region
+// pages: neighbor tensors share 4K pages, so a rounded-out drop would zero
+// a live neighbor); inward=false rounds OUT (file-backed blob pages are
+// safe to over-drop — they re-fault from the file).
+static void k9_madvise_drop(void * ptr, size_t len, bool inward) {
+    static const size_t PS = sysconf(_SC_PAGESIZE);
+    uintptr_t a = (uintptr_t) ptr;
+    uintptr_t z = a + len;
+    if (inward) {
+        const uintptr_t na = (a + PS - 1) / PS * PS;
+        const uintptr_t nz = z / PS * PS;
+        if (na >= nz) {
+            return;
+        }
+        a = na;
+        z = nz;
+    } else {
+        a = a / PS * PS;
+        z = (z + PS - 1) / PS * PS;
+    }
+    if (madvise((void *) a, z - a, MADV_DONTNEED) != 0) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("k9 residency: madvise(MADV_DONTNEED) failed: %s (RSS will track the whole blob)\n",
+                           strerror(errno));
+        }
+    }
 }
 
 bool g_enabled_init = false;
@@ -53,69 +84,56 @@ k9_residency & k9_residency::get() {
     return inst;
 }
 
-const void * k9_residency::poison_base() {
-    return get().arena_base;
-}
-
 void k9_residency::reset() {
-    if (arena) {
-        ggml_backend_buffer_free(arena);
-        arena = nullptr;
+    if (buf) {
+        ggml_backend_buffer_free(buf);
+        buf = nullptr;
+    }
+    if (region) {
+        munmap(region, region_size);
+        region = nullptr;
     }
     by_name.clear();
-    free_ranges.clear();
-    arena_base = nullptr;
-    arena_size = 0;
-    slot_start = 0;
-    arena_high = 0;
     total_bytes = 0;
-    max_bytes = 0;
-    materialized_bytes = 0;
+    region_size = 0;
+    moe_decoded = 0;
     clock = 0;
     budget = 0;
-    n_hits = n_mat = n_evict = 0;
+    n_mat = n_evict = 0;
 }
 
-void k9_residency::prepare_arena(size_t total, size_t max_tensor) {
-    if (arena) {
-        return; // already prepared
+void k9_residency::prepare_region(size_t total) {
+    if (region) {
+        return; // idempotent (multi-ctx loads)
     }
     const double gib = env_float("K9_BUDGET_GIB");
-    // full-residency mode still needs the poison slab + per-tensor rounding
-    // slack on top of the raw byte sum, or the frontier wedges at the last
-    // tensor
-    budget = gib > 0.0 ? (size_t)(gib * 1073741824.0)
-                       : total + K9_POISON_SIZE + ((size_t) 4 << 20);
-    const size_t need_min = K9_POISON_SIZE + round_up(max_tensor, K9_SLOT_ALIGN);
-    if (budget < need_min) {
+    budget = gib > 0.0 ? (size_t)(gib * 1073741824.0) : 0; // 0 = unlimited
+    region_size = total;
+#ifdef MAP_NORESERVE
+    region = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+#else
+    region = mmap(nullptr, total, PROT_READ | PROT_WRITE,
+                  MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+#endif
+    if (region == MAP_FAILED) {
+        region = nullptr;
         throw std::runtime_error(format(
-            "k9 residency: K9_BUDGET_GIB=%.2f too small — need at least the largest tensor (%.2f GiB) + poison slab",
-            gib, (double) need_min / 1073741824.0));
+            "k9 residency: failed to map the %.2f GiB NORESERVE region",
+            total / 1073741824.0));
     }
-    arena = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), budget);
-    ggml_backend_buffer_set_usage(arena, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    arena_base = (uint8_t *) ggml_backend_buffer_get_base(arena);
-    arena_size = budget;
-    slot_start = K9_POISON_SIZE;
-    arena_high = slot_start;
-    memset(arena_base, 0, K9_POISON_SIZE); // poison slab reads as zeros
-    LLAMA_LOG_WARN("k9 residency: arena %.2f GiB for %.2f GiB of K9 tensors%s\n",
-                   budget / 1073741824.0, total / 1073741824.0,
-                   budget < total ? " (paged)" : "");
+    buf = ggml_backend_cpu_buffer_from_ptr(region, total);
+    ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE)%s\n",
+                   total / 1073741824.0,
+                   budget ? format(", expert-page budget %.2f GiB", budget / 1073741824.0).c_str() : "");
 }
 
-bool k9_residency::home_dummy(struct ggml_tensor * cur) {
+bool k9_residency::home_fixed(struct ggml_tensor * cur, size_t offset) {
     if (cur->data != nullptr || cur->buffer != nullptr) {
-        return false; // homed elsewhere — caller registers as external
+        return false; // homed elsewhere — caller decodes eagerly
     }
-    // Overlapping dummy assignment: every K9 tensor points at the poison
-    // slab until its first materialization re-points it. Individually each
-    // tensor fits (prepare_arena enforces budget >= largest tensor), and
-    // ggml_backend_tensor_alloc does no cumulative tracking, so the shared
-    // base address is legal. This must happen BEFORE the scheduler's first
-    // reserve, or unhomed tensors get transient compute-buffer homes whose
-    // fills the ops never see (v1 gotcha).
-    ggml_backend_tensor_alloc(arena, cur, arena_base);
+    ggml_backend_tensor_alloc(buf, cur, (uint8_t *) region + offset);
     return true;
 }
 
@@ -124,8 +142,12 @@ void k9_residency::register_tensor(const std::string & name,
                                    const k9_tensor_meta & meta,
                                    const int64_t f_ne[2], ggml_type dst,
                                    struct ggml_tensor * cur, size_t nbytes,
-                                   bool in_arena) {
+                                   size_t region_off, bool in_arena, bool moe) {
     auto & e = by_name[name];
+    if (e.blob != nullptr) {
+        LLAMA_LOG_ERROR("k9 residency: DUPLICATE REGISTER for %s (previous blob=%p)\n",
+                        name.c_str(), (void *) e.blob);
+    }
     e.blob = blob;
     e.blob_len = blob_len;
     e.meta = meta;
@@ -134,162 +156,234 @@ void k9_residency::register_tensor(const std::string & name,
     e.dst = dst;
     e.cur = cur;
     e.nbytes = nbytes;
+    e.region_off = region_off;
     e.in_arena = in_arena;
+    e.moe = moe && in_arena; // external MoE tensors decode eagerly in the loader
+    e.lanes = meta.lanes ? meta.lanes : 1;
+    e.rows = (size_t) f_ne[1];
+    e.row_bytes = e.rows ? nbytes / e.rows : 0;
+    e.rows_per = (uint32_t) ((e.rows + e.lanes - 1) / e.lanes);
+    if (e.lanes > 255) {
+        throw std::runtime_error(format(
+            "k9 residency: %s has %u lanes — inline page state caps at 255 (re-export with a larger --page-mib)",
+            name.c_str(), e.lanes));
+    }
+    e.page_dec.fill(0);
+    e.page_stamp.fill(0);
+    e.ms = nullptr;
     e.stamp = 0;
     e.in_graph = false;
     e.last_use = -1;
     total_bytes += nbytes;
-    max_bytes = std::max(max_bytes, nbytes);
-    LLAMA_LOG_WARN("k9 residency: registered %s (%.2f MiB, %u pages)%s — %zu tensors, %.2f GiB total\n",
-                   name.c_str(), nbytes / 1048576.0, meta.lanes,
-                   in_arena ? "" : " [external]",
-                   by_name.size(), total_bytes / 1073741824.0);
+    LLAMA_LOG_WARN("k9 residency: registered %s (%.2f MiB, %u pages%s) — %zu tensors\n",
+                   name.c_str(), nbytes / 1048576.0, e.lanes,
+                   e.moe ? ", MoE" : "", by_name.size());
 }
 
-size_t k9_residency::carve(size_t nbytes) {
-    const size_t want = round_up(nbytes, K9_SLOT_ALIGN);
-    // first fit over recycled ranges
-    for (auto it = free_ranges.begin(); it != free_ranges.end(); ++it) {
-        if (it->second >= want) {
-            const size_t off = it->first;
-            if (it->second > want) {
-                *it = { it->first + want, it->second - want };
-            } else {
-                free_ranges.erase(it);
-            }
-            return off;
-        }
-    }
-    // then the bump frontier (evict_until guarantees room in bytes; guard
-    // the physical frontier against fragmentation edge cases)
-    if (arena_high + want > arena_size) {
-        throw std::runtime_error(format(
-            "k9 residency: arena frontier exhausted (%.2f GiB arena, need %.2f MiB) — raise K9_BUDGET_GIB",
-            arena_size / 1073741824.0, want / 1048576.0));
-    }
-    const size_t off = arena_high;
-    arena_high += want;
-    return off;
+size_t k9_residency::page_off(const entry & e, uint32_t p) const {
+    return e.region_off + (size_t) p * e.rows_per * e.row_bytes;
 }
 
-void k9_residency::evict_until(size_t need, int64_t before_idx) {
-    // PHYSICAL condition: the arena holds the poison slab + rounded slots,
-    // so a byte-sum check against budget can leave eviction asleep while
-    // the frontier hits the wall. Evict while physical free space cannot
-    // hold the rounded request.
-    const size_t want = round_up(need, K9_SLOT_ALIGN);
-    // CONTIGUITY-aware condition: scattered crumbs can sum past the request
-    // while no single span fits it. Evict until the largest contiguous span
-    // (bump room or a free range) can hold `want`.
-    auto max_contig = [&]() {
-        size_t m = arena_size - arena_high;
-        for (const auto & r : free_ranges) {
-            m = std::max(m, r.second);
-        }
-        return m;
-    };
-    while (max_contig() < want) {
-        // EXECUTION-SAFE victims ONLY: last_use > before_idx — such a tensor
-        // is re-decoded at its next-use node later in THIS ensure pass, so
-        // every execution read sees decoded bytes. A tensor with
-        // last_use <= before_idx would be read by the graph's execution
-        // AFTER this ensure with no re-fill in between (fills all happen
-        // pre-execution) — freeing it corrupts the run. For DENSE models
-        // every tensor is used every token, so a sub-working-set budget
-        // cannot ever evict: the error below is the honest answer, and real
-        // memory relief for MoE lands at the expert-granular rung (M3),
-        // where the graph only touches selected experts per token.
-        entry * victim = nullptr;
-        for (auto & [nm, e] : by_name) {
-            if (e.in_arena && e.resident() && e.last_use > before_idx &&
-                    (!victim || e.stamp < victim->stamp)) {
-                victim = &e;
-            }
-        }
-        if (!victim) {
-            throw std::runtime_error(format(
-                "k9 residency: arena budget %.2f GiB below this graph's working set "
-                "(need %.2f MiB contiguous; dense models need the full model as budget — "
-                "sub-working-set paging arrives with expert-granular M3). Raise K9_BUDGET_GIB.",
-                budget / 1073741824.0, need / 1048576.0));
-        }
-        // free the slot FIRST (read the offset while data still points at
-        // it), then poison — swapping this order once cost a debugging hour
-        if (env_flag("K9_RESIDENT_DEBUG")) {
-            LLAMA_LOG_WARN("k9 residency: victim %s [&e=%p] data=%p last_use=%lld by node %lld\n",
-                           victim->meta.name.c_str(), (void *) victim,
-                           victim->cur->data, (long long) victim->last_use,
-                           (long long) before_idx);
-        }
-        const size_t off = (size_t)((uint8_t *) victim->cur->data - arena_base);
-        const size_t sz  = round_up(victim->nbytes, K9_SLOT_ALIGN);
-        bool merged = false;
-        for (auto & r : free_ranges) {
-            if (r.first + r.second == off) {
-                r.second += sz;
-                merged = true;
-                break;
-            }
-            if (off + sz == r.first) {
-                r.first = off;
-                r.second += sz;
-                merged = true;
-                break;
-            }
-        }
-        if (!merged) {
-            free_ranges.emplace_back(off, sz);
-        }
-        if (env_flag("K9_RESIDENT_DEBUG")) {
-            LLAMA_LOG_WARN("k9 residency: evicted %s slot@%.2f MiB by node %lld (victim last_use=%lld)\n",
-                           victim->meta.name.c_str(), off / 1048576.0,
-                           (long long) before_idx, (long long) victim->last_use);
-        }
-        victim->cur->data = arena_base; // poison slab: reads give zeros, never stale garbage
-        victim->stamp = 0;
-        materialized_bytes -= victim->nbytes;
-        n_evict++;
-        if (n_evict <= 8 || n_evict % 512 == 0) {
-            LLAMA_LOG_WARN("k9 residency: evicted %s (evictions %zu)\n",
-                           victim->meta.name.c_str(), n_evict);
-        }
-    }
+size_t k9_residency::page_bytes(const entry & e, uint32_t p) const {
+    const size_t a = (size_t) p * e.rows_per;
+    const size_t b = std::min<size_t>(e.rows, a + e.rows_per);
+    return (b - a) * e.row_bytes;
 }
 
-void k9_residency::materialize_entry(entry & e, int64_t node_idx) {
-    if (!e.in_arena) {
-        if (e.stamp == 0) {
-            // externally homed: decode in place once (stamp doubles as the
-            // filled-flag for externals), never evicted
-            std::string err;
-            if (!k9_dequantize(e.blob, e.blob_len, e.meta, e.f_ne, e.dst, e.cur->data, err)) {
-                throw std::runtime_error(format("k9 residency: decode of %s failed: %s",
-                                                e.meta.name.c_str(), err.c_str()));
-            }
-            e.stamp = ++clock;
-            materialized_bytes += e.nbytes;
-            n_mat++;
-        }
-        return;
+bool k9_residency::ensure_page(entry & e, uint32_t p) {
+    if ((e.page_dec[p >> 6] >> (p & 63)) & 1) {
+        e.page_stamp[p] = (uint32_t) ++clock;
+        return true;
     }
-    evict_until(e.nbytes, node_idx);
-    const size_t off = carve(e.nbytes);
-    uint8_t * slot = arena_base + off;
+    const size_t sz = page_bytes(e, p);
+    if (e.ms == nullptr) {
+        // cached scales: decoded once (the ent8 stream is whole-tensor)
+        const int64_t ng = e.f_ne[0] / (int64_t) e.meta.group;
+        e.ms = (float *) malloc(sizeof(float) * e.rows * ng);
+        std::string err;
+        if (!k9_decode_scales(e.blob, e.blob_len, e.meta, e.rows * ng, e.ms, err)) {
+            throw std::runtime_error(format("k9 residency: scale decode of %s failed: %s",
+                                            e.meta.name.c_str(), err.c_str()));
+        }
+    }
     std::string err;
-    if (!k9_dequantize(e.blob, e.blob_len, e.meta, e.f_ne, e.dst, slot, err)) {
-        throw std::runtime_error(format("k9 residency: decode of %s failed: %s",
+    // dest = the tensor's region base: k9_decode_page packs the page's rows
+    // at their global materialized positions (verified byte-equal in v2)
+    if (!k9_decode_page(e.blob, e.blob_len, e.meta, e.f_ne, e.dst, p,
+                        e.rows_per, e.ms, (uint8_t *) region + e.region_off, err)) {
+        throw std::runtime_error(format("k9 residency: page decode of %s failed: %s",
                                         e.meta.name.c_str(), err.c_str()));
     }
-    e.cur->data = slot;
-    e.stamp = ++clock;
-    materialized_bytes += e.nbytes;
-    n_mat++;
-    if (env_flag("K9_RESIDENT_DEBUG") && n_mat <= 24) {
-        LLAMA_LOG_WARN("k9 residency: carve #%zu %s (%.2f MiB) at node %lld — high=%.1f MiB mat=%.1f MiB\n",
-                       n_mat, e.meta.name.c_str(), e.nbytes / 1048576.0,
-                       (long long) node_idx, (arena_high - slot_start) / 1048576.0,
-                       materialized_bytes / 1048576.0);
+    e.page_dec[p >> 6] |= (uint64_t)(1ull << (p & 63));
+    if (env_flag("K9_RESIDENT_DEBUG") && !((e.page_dec[p >> 6] >> (p & 63)) & 1)) {
+        LLAMA_LOG_WARN("k9 residency: BIT DID NOT STICK %s page %u\n", e.meta.name.c_str(), p);
     }
+    e.page_stamp[p] = (uint32_t) ++clock;
+    moe_decoded += sz;
+    n_mat++;
+    return true;
+}
+
+bool k9_residency::moe_ensure(const struct ggml_tensor * weights, const struct ggml_tensor * ids) {
+    const char * nm = ggml_get_name(weights);
+    if (!nm || !nm[0]) {
+        return false;
+    }
+    auto it = by_name.find(std::string_view(nm));
+    if (it == by_name.end() || !it->second.in_arena || !it->second.moe) {
+        return false;
+    }
+    entry & e = it->second;
+    if (env_flag("K9_RESIDENT_DEBUG")) {
+        uint32_t bits = 0;
+        for (uint32_t p = 0; p < e.lanes; p++) {
+            bits += (uint32_t)((e.page_dec[p >> 6] >> (p & 63)) & 1);
+        }
+        LLAMA_LOG_WARN("k9 residency: hook-enter %s [&e=%p] bits=%u/%u moe_dec=%.1f MiB\n",
+                       e.meta.name.c_str(), (void *) &e, bits, e.lanes,
+                       moe_decoded / 1048576.0);
+    }
+
+    const int32_t * idata = (const int32_t *) ids->data;
+    if (idata == nullptr || ids->type != GGML_TYPE_I32) {
+        return false;
+    }
+    const int64_t n_used = ids->ne[0];
+    const int64_t n_tok  = ids->ne[1];
+    const uint32_t n_exp = (uint32_t) weights->ne[2];
+    if (n_exp == 0 || e.rows % n_exp != 0) {
+        throw std::runtime_error(format(
+            "k9 residency: MoE tensor %s rows (%zu) not divisible by experts (%u)",
+            e.meta.name.c_str(), e.rows, n_exp));
+    }
+    const size_t expert_rows = e.rows / n_exp;
+
+    // RESERVATION semantics: collect the WHOLE call's lane set first, evict
+    // only non-set pages until the set fits the budget, THEN decode. A
+    // per-page check lets the call evict its own earlier pages (each new
+    // lane eats the previous ones) and the kernel reads zero pages.
+    std::vector<std::pair<entry *, uint32_t>> want;
+    auto want_has = [&](const entry * en, uint32_t p) {
+        for (const auto & w : want) {
+            if (w.first == en && w.second == p) {
+                return true;
+            }
+        }
+        return false;
+    };
+    std::vector<uint64_t> seen((n_exp + 63) / 64, 0);
+    size_t need = 0;      // bytes to decode for this call
+    size_t in_set_resident = 0; // bytes of the set already decoded
+    for (int64_t j = 0; j < n_used * n_tok; j++) {
+        const int32_t id = idata[j];
+        if (id < 0 || (uint32_t) id >= n_exp || ((seen[id >> 6] >> (id & 63)) & 1)) {
+            continue;
+        }
+        seen[id >> 6] |= (uint64_t)(1ull << (id & 63));
+        const size_t a = (size_t) id * expert_rows;
+        const size_t b = a + expert_rows;
+        for (uint32_t p = (uint32_t)(a / e.rows_per);
+             p <= (uint32_t)((b - 1) / e.rows_per) && p < e.lanes; p++) {
+            if (want_has(&e, p)) {
+                continue;
+            }
+            want.emplace_back(&e, p);
+            const size_t sz = page_bytes(e, p);
+            if ((e.page_dec[p >> 6] >> (p & 63)) & 1) {
+                in_set_resident += sz;
+            } else {
+                need += sz;
+            }
+        }
+    }
+
+    // evict LRU pages OUTSIDE the set until the call fits
+    while (budget != 0 && moe_decoded - in_set_resident + need > budget) {
+        entry * ve = nullptr;
+        uint32_t vp = 0;
+        for (auto & [en2, en] : by_name) {
+            if (!en.moe) {
+                continue;
+            }
+            for (uint32_t p = 0; p < en.lanes; p++) {
+                const bool dec = (en.page_dec[p >> 6] >> (p & 63)) & 1;
+                if (dec && !want_has(&en, p) &&
+                        (!ve || en.page_stamp[p] < ve->page_stamp[vp])) {
+                    ve = &en;
+                    vp = p;
+                }
+            }
+        }
+        if (!ve) {
+            // accounting audit: bitmap-derived decoded bytes vs the counter
+            size_t bitmap_bytes = 0;
+            int audit_n = 0;
+            for (auto & [en2, en] : by_name) {
+                if (!en.moe) {
+                    continue;
+                }
+                size_t entry_bits = 0;
+                for (uint32_t p = 0; p < en.lanes; p++) {
+                    if ((en.page_dec[p >> 6] >> (p & 63)) & 1) {
+                        entry_bits++;
+                        bitmap_bytes += page_bytes(en, p);
+                    }
+                }
+                if (audit_n < 3) {
+                    LLAMA_LOG_ERROR("k9 residency:   audit %s lanes=%u rows=%zu row_bytes=%zu bits=%zu first=%lx,%lx page0=%zu\n",
+                                    en2.c_str(), en.lanes, en.rows, en.row_bytes,
+                                    entry_bits,
+                                    en.lanes > 0 ? en.page_dec[0] : 0ul,
+                                    en.lanes > 1 ? en.page_dec[1] : 0ul,
+                                    en.lanes > 0 ? page_bytes(en, 0) : 0ul);
+                    audit_n++;
+                }
+            }
+            LLAMA_LOG_ERROR("k9 residency: AUDIT moe_decoded=%.2f MiB bitmap=%.2f MiB drift=%.2f MiB (in_set=%.2f MiB, need=%.2f MiB)\n",
+                            moe_decoded / 1048576.0, bitmap_bytes / 1048576.0,
+                            ((double) moe_decoded - (double) bitmap_bytes) / 1048576.0,
+                            in_set_resident / 1048576.0, need / 1048576.0);
+            throw std::runtime_error(format(
+                "k9 residency: expert-page budget %.2f GiB smaller than one op's "
+                "selected-expert set (%.2f MiB) and nothing outside it to evict — raise K9_BUDGET_GIB",
+                budget / 1073741824.0, need / 1048576.0));
+        }
+        const size_t off = page_off(*ve, vp);
+        const size_t sz  = page_bytes(*ve, vp);
+        // inward rounding: adjacent region slots share 4K pages
+        k9_madvise_drop((uint8_t *) region + off, sz, true); // back to zero pages
+        ve->page_dec[vp >> 6] &= ~(uint64_t)(1ull << (vp & 63));
+        ve->page_stamp[vp] = 0;
+        moe_decoded -= std::min(sz, moe_decoded);
+        n_evict++;
+        if (n_evict <= 8 || n_evict % 512 == 0) {
+            LLAMA_LOG_WARN("k9 residency: evicted %s page %u (%.2f MiB) — evictions %zu\n",
+                           ve->meta.name.c_str(), vp, sz / 1048576.0, n_evict);
+        }
+    }
+
+    // decode the set (all fits now; per-page stamps refresh in order)
+    for (const auto & w : want) {
+        ensure_page(*w.first, w.second);
+    }
+    // drop the blob's file pages for the decoded lanes: the digit streams
+    // re-fault from the file on the next decode of that range, so peak RSS
+    // tracks the expert budget instead of the whole blob mapping
+    {
+        const size_t otab = 4ull * (e.lanes + 1);
+        const uint32_t * ot = (const uint32_t *) (e.blob + e.meta.tbl);
+        for (const auto & w : want) {
+            if (w.first != &e) {
+                continue;
+            }
+            const uint32_t p = w.second;
+            const size_t off = e.meta.tbl + otab + ot[p];
+            const size_t len = ot[p + 1] - ot[p];
+            // outward rounding: file-backed pages are safe to over-drop
+            k9_madvise_drop((uint8_t *) e.blob + off, len, false);
+        }
+    }
+    return true;
 }
 
 void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
@@ -299,18 +393,13 @@ void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
     static bool traced = false;
     for (auto & [nm, e] : by_name) {
         e.in_graph = false;
-        e.last_use = -1;
     }
     const int n = ggml_graph_n_nodes(const_cast<struct ggml_cgraph *>(gf));
 
-    // Weights are graph LEAFS (srcs of ops), not nodes, and ggml_cgraph is
-    // opaque with no leaf accessors — so walk node srcs (depth 2 covers
-    // op -> view -> weight chains). Match by name (stable, unique) and
-    // rebind the entry to the graph's tensor object, preferring non-view
-    // tensors (a view's data is a subrange — the full-tensor decode must
-    // land in the owning tensor).
-    size_t matched = 0, distinct = 0, n_view = 0;
-    std::function<void(ggml_tensor *, int, int)> visit = [&](ggml_tensor * t, int depth, int idx) {
+    // mark membership (weights are graph LEAFS — walk node srcs, depth 2;
+    // match by name; rebind to the graph's object, preferring non-views)
+    size_t matched = 0, distinct = 0;
+    std::function<void(ggml_tensor *, int)> visit = [&](ggml_tensor * t, int depth) {
         if (!t) {
             return;
         }
@@ -323,12 +412,8 @@ void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
                     distinct++;
                 }
                 e.in_graph = true;
-                e.last_use = std::max<int64_t>(e.last_use, idx);
                 if (e.cur == nullptr || (e.cur->view_src && !t->view_src)) {
                     e.cur = t;
-                }
-                if (t->view_src) {
-                    n_view++;
                 }
                 matched++;
             }
@@ -338,65 +423,68 @@ void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
                 if (!t->src[s]) {
                     break;
                 }
-                visit(t->src[s], depth - 1, idx);
+                visit(t->src[s], depth - 1);
             }
         }
     };
-
     for (int i = 0; i < n; i++) {
         ggml_tensor * node = ggml_graph_node(const_cast<struct ggml_cgraph *>(gf), i);
         if (node) {
-            visit(node, 2, i);
+            visit(node, 2);
         }
     }
     if (!traced) {
         traced = true;
         LLAMA_LOG_WARN("k9 residency: first ensure_graph: %d nodes, %zu registered, "
-                       "%zu matched, %zu distinct, %zu view-bound\n",
-                       n, by_name.size(), matched, distinct, n_view);
+                       "%zu matched, %zu distinct\n",
+                       n, by_name.size(), matched, distinct);
     }
 
-    // materialize misses in node order; LRU-hit the rest. Eviction may only
-    // drop tensors whose last use is not the current node.
-    for (int i = 0; i < n; i++) {
-        ggml_tensor * node = ggml_graph_node(const_cast<struct ggml_cgraph *>(gf), i);
-        if (!node) {
+    // fill non-MoE tensors wholly (first use, then resident forever); MoE
+    // expert tensors are hook-managed at mul_mat_id execution time
+    for (auto & [nm, e] : by_name) {
+        if (!e.in_graph || e.moe || !e.in_arena) {
             continue;
         }
-        std::function<void(ggml_tensor *, int)> fill = [&](ggml_tensor * t, int depth) {
-            if (!t) {
-                return;
-            }
-            const char * nm = ggml_get_name(t);
-            if (nm && nm[0]) {
-                auto it = by_name.find(std::string_view(nm));
-                if (it != by_name.end()) {
-                    entry & e = it->second;
-                    if (e.in_arena && e.stamp != 0 && !e.resident()) {
-                        // resident-state is derived; an arena tensor with a
-                        // fill stamp but poisoned data was invalidated out-
-                        // side the evict path — log it and self-heal by
-                        // re-decoding below
-                        LLAMA_LOG_WARN("k9 residency: invalidated %s at node %lld — re-decoding\n",
-                                       nm, (long long) i);
-                    }
-                    if (e.resident() || (!e.in_arena && e.stamp != 0)) {
-                        e.stamp = ++clock;
-                        n_hits++;
-                    } else {
-                        materialize_entry(e, i);
-                    }
-                }
-            }
-            if (depth > 0) {
-                for (int s = 0; s < GGML_MAX_SRC; s++) {
-                    if (!t->src[s]) {
-                        break;
-                    }
-                    fill(t->src[s], depth - 1);
-                }
-            }
-        };
-        fill(node, 2);
+        if (e.stamp != 0) {
+            e.stamp = ++clock;
+            continue;
+        }
+        std::string err;
+        if (!k9_dequantize(e.blob, e.blob_len, e.meta, e.f_ne, e.dst,
+                           (uint8_t *) region + e.region_off, err)) {
+            throw std::runtime_error(format("k9 residency: decode of %s failed: %s",
+                                            e.meta.name.c_str(), err.c_str()));
+        }
+        e.stamp = ++clock;
+        n_mat++;
     }
+}
+
+// C hook (see ggml/include/k9-moe-hook.h), called from ggml-cpu's mul_mat_id.
+// MUST NOT let exceptions cross the C frames of ggml-cpu.c ("terminate called
+// recursively") — operational impossibilities abort loudly instead.
+bool k9_res_moe_is_managed(const struct ggml_tensor * weights) {
+    if (!k9_residency::active()) {
+        return false;
+    }
+    const char * nm = ggml_get_name(weights);
+    if (!nm || !nm[0]) {
+        return false;
+    }
+    return k9_residency::get().is_managed(std::string_view(nm));
+}
+
+bool k9_res_moe_ensure(const struct ggml_tensor * weights, const struct ggml_tensor * ids) {
+    if (!k9_residency::active()) {
+        return false;
+    }
+    try {
+        return k9_residency::get().moe_ensure(weights, ids);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure failed: %s\n", e.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure failed (unknown exception)\n");
+    }
+    abort();
 }

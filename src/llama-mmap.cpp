@@ -514,6 +514,13 @@ struct llama_mmap::impl {
             for (const auto & range : ranges_complement(lazy_ranges, std::min(file->size(), prefetch))) {
                 advise(range.first, range.second, POSIX_MADV_WILLNEED, "POSIX_MADV_WILLNEED");
             }
+        } else {
+            // v3 M3 residency (docs/13 §2.6): no prefetch, and DROP whatever
+            // the mapping faulted during setup — blob pages re-fault from
+            // the file per decode, keeping RSS at the budget instead of the
+            // whole file. Safe because resident mode never writes into the
+            // mapping (no COW pages exist to lose).
+            advise(0, file->size(), POSIX_MADV_DONTNEED, "POSIX_MADV_DONTNEED");
         }
         for (const auto & range : lazy_ranges) {
             advise(range.first, range.second, POSIX_MADV_RANDOM, "POSIX_MADV_RANDOM");

@@ -1,33 +1,32 @@
 #pragma once
-// v3 residency (docs/13 §2.6, gates 3+): tensor-granular lazy
-// materialization for K9 stream tensors.
+// v3 residency (docs/13 §2.6): lazy materialization of K9 stream tensors.
 //
-// M2.5 (real-budget arena): K9_RESIDENT=1 homes every K9 tensor into a
-// BUDGET-SIZED arena at load — all tensors get overlapping dummy data
-// pointers at a zeroed poison slab so the scheduler never re-homes them
-// into its transient compute buffers (the v1 hard-won invariant). At each
-// graph step, ensure_graph re-points a tensor's data into a real arena
-// slot after decoding it there, and LRU eviction frees slots (re-pointing
-// victims at the poison slab). Memory usage is now bounded by
-// K9_BUDGET_GIB instead of the full materialized size.
+// M3 (real memory relief): ONE MAP_NORESERVE region backs every K9 tensor
+// at a fixed offset (virtual cost only — anonymous zero pages are free).
+// Pages are the container's v3 lanes (row-aligned, independently decodable
+// via k9_decode_page). Non-MoE tensors fill wholly at the first graph use;
+// MoE expert tensors are HOOK-managed: the CPU mul_mat_id op calls
+// k9_res_moe_ensure at execution time, when the router ids are actually
+// known, and only the selected experts' lanes get decoded. Eviction is
+// madvise(MADV_DONTNEED) — the kernel reclaims the pages, so RSS is the
+// honest measure. K9_BUDGET_GIB caps decoded expert-page bytes (0 =
+// unlimited); non-MoE tensors are the irreducible working set and always
+// resident.
 //
-// Decoding is k9_dequantize (byte-exact), so a fully-resident run and a
-// constrained-budget run produce identical weights (docs/13 §2.4 gate 3:
-// token-identical under eviction).
+// The hook is execution-safe BY CONSTRUCTION (decode happens inside the op,
+// before the kernel reads) — dissolving the M2.5 finding that dense
+// pre-execution fills cannot evict. CPU backend today; the A9/HIP port
+// reuses the same region over unified memory.
 //
 // Env:
-//   K9_RESIDENT=1      enable lazy materialization (default off = eager)
-//   K9_BUDGET_GIB=f    arena budget in GiB; 0 or unset = full residency
-//                      (arena = sum of K9 tensors, no eviction — v1 size)
-//
-// CPU backend (the soak/rung target). The arena is allocated from the CPU
-// buffer type; the A9/HIP port (unified-memory buft) follows.
+//   K9_RESIDENT=1      enable (default off = eager decode-on-load)
+//   K9_BUDGET_GIB=f    expert-page budget in GiB (0/unset = unlimited)
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include "ggml.h"
@@ -46,31 +45,33 @@ public:
     // Drop all state (call before a fresh model load in the same process).
     void reset();
 
-    // Allocate the arena. Call once from the loader before the first
-    // register/home (it knows the K9 totals). budget 0 = full residency.
-    void prepare_arena(size_t total_bytes, size_t max_tensor_bytes);
+    // Map the NORESERVE region. Call once from the loader before any homing.
+    void prepare_region(size_t total_bytes);
 
-    // Dummy-home a tensor into the arena (overlapping at the poison slab)
-    // so the scheduler sees it buffered. Returns false if the tensor was
-    // already homed elsewhere (caller should register it as external).
-    bool home_dummy(struct ggml_tensor * cur);
+    // Fixed home for a tensor at `offset` in the region. Returns false when
+    // the tensor was homed elsewhere (caller registers it as external).
+    bool home_fixed(struct ggml_tensor * cur, size_t offset);
 
-    // Called from the loader's K9 branch. blob must point into memory that
-    // outlives the model.
+    // Called from the loader's K9 branch. blob must outlive the model.
+    // moe = rank-3 expert tensor (ne[2] > 1) → hook-managed pages.
     void register_tensor(const std::string & name,
                          const uint8_t * blob, size_t blob_len,
                          const k9_tensor_meta & meta,
                          const int64_t f_ne[2], ggml_type dst,
                          struct ggml_tensor * cur, size_t nbytes,
-                         bool in_arena);
+                         size_t region_off, bool in_arena, bool moe);
 
-    // Decode-on-demand + LRU eviction for every registered tensor referenced
-    // by the graph. Cheap no-op when nothing is registered. Called from
-    // llama_context::graph_compute before the scheduler runs the graph.
-    // Matching is BY NAME: the graph holds leaf tensors that may be
-    // different ggml_tensor objects than the loader's list, but names are
-    // stable and unique; entries rebind to the graph's object at match time.
+    // Pre-execution fill for non-MoE tensors (MoE tensors are hook-managed).
     void ensure_graph(const struct ggml_cgraph * gf);
+
+    // M3 hook: called from ggml-cpu's mul_mat_id (thread 0).
+    bool moe_ensure(const struct ggml_tensor * weights, const struct ggml_tensor * ids);
+
+    // registry membership check for the C managed-check (no decode)
+    bool is_managed(std::string_view name) const {
+        auto it = by_name.find(name);
+        return it != by_name.end() && it->second.in_arena && it->second.moe;
+    }
 
 private:
     k9_residency() = default;
@@ -83,44 +84,39 @@ private:
         ggml_type       dst     = GGML_TYPE_F32;
         ggml_tensor   * cur     = nullptr;  // rebound to the graph's object per ensure
         size_t          nbytes  = 0;
-        bool            in_arena  = true;   // false = externally homed (in-place)
-        uint64_t        stamp   = 0;
+        size_t          region_off = 0;     // fixed home in the region
+        bool            in_arena = true;    // false = externally homed
+        bool            moe     = false;    // rank-3 expert tensor → hook-managed
+        size_t          rows    = 0;        // stored rows (f_ne[1])
+        uint32_t        lanes   = 1;        // page count
+        uint32_t        rows_per = 0;       // stored rows per page
+        size_t          row_bytes = 0;      // materialized bytes per stored row
+        // INLINE page state: lanes <= 255 (u8 field), so 4 u64 of bitmap +
+        // 255 stamps fit without heap. Heap-resident vectors for these were
+        // observed being wiped between hook calls during bring-up (the
+        // byte counter in the same entry survived) — inline storage is
+        // immune to whatever recycles those blocks.
+        std::array<uint64_t, 4>  page_dec{};   // decoded bitmap (lanes bits)
+        std::array<uint32_t, 255> page_stamp{}; // LRU per page
+        float         * ms      = nullptr;  // cached decoded scales (r*ng floats)
+        uint64_t        stamp   = 0;        // entry-level LRU (non-MoE)
         bool            in_graph = false;   // scratch for the current ensure pass
-        int64_t         last_use = -1;      // highest node index using this tensor
-
-        // materialized state is DERIVED: an arena tensor is resident iff
-        // cur->data points outside the poison slab. (A plain bool field was
-        // observed going stale vs cur->data during bring-up — the tensor's
-        // own pointer is the single source of truth.)
-        bool resident() const {
-            return cur != nullptr && cur->data != nullptr &&
-                   cur->data != k9_residency::poison_base();
-        }
+        int64_t         last_use = -1;
     };
 
-    void materialize_entry(entry & e, int64_t node_idx);
-    void evict_until(size_t need, int64_t before_idx);
-    size_t carve(size_t nbytes);
-
-public:
-    // poison-slab identity check for entry::resident() (single definition point)
-    static const void * poison_base();
-private:
+    bool ensure_page(entry & e, uint32_t page);
+    size_t page_off(const entry & e, uint32_t p) const;
+    size_t page_bytes(const entry & e, uint32_t p) const;
 
     // transparent comparator: graph lookups pass string_view without allocs
     std::map<std::string, entry, std::less<>> by_name;
     size_t total_bytes = 0;
-    size_t max_bytes   = 0;
-    size_t materialized_bytes = 0;
 
-    ggml_backend_buffer_t arena = nullptr;
-    uint8_t * arena_base = nullptr;
-    size_t    arena_size = 0;   // total budget bytes
-    size_t    slot_start = 0;   // first usable offset (after the poison slab)
-    size_t    arena_high = 0;   // bump frontier; recycled ranges in free_ranges
-    std::vector<std::pair<size_t, size_t>> free_ranges; // (offset, size), 64-aligned
-
-    uint64_t clock = 0;
-    size_t budget = 0;   // bytes; decided at prepare_arena
-    size_t n_hits = 0, n_mat = 0, n_evict = 0;
+    void * region = nullptr;             // MAP_NORESERVE anonymous mapping
+    size_t region_size = 0;
+    ggml_backend_buffer_t buf = nullptr; // cpu buffer over the region
+    size_t budget = 0;                   // expert-page decoded-bytes cap (0 = unlimited)
+    size_t moe_decoded = 0;              // decoded expert-page bytes
+    uint64_t clock = 0;                  // page LRU clock
+    size_t n_mat = 0, n_evict = 0;
 };

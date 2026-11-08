@@ -3,6 +3,7 @@
 
 #include "ggml-backend-impl.h"
 #include "ggml-backend.h"
+#include "k9-moe-hook.h"
 #include "traits.h"
 #include "ggml-cpu-impl.h"
 #include "ggml-impl.h"
@@ -1593,6 +1594,18 @@ static void ggml_compute_forward_mul_mat_id(
 
     const int ith = params->ith;
     const int nth = params->nth;
+
+    // K9 (fork): M3 — the router ids are a runtime tensor, only known at
+    // execution. Thread 0 decodes the selected experts' pages; all threads
+    // barrier before the kernel reads them (docs/13 §2.6). The managed
+    // check runs on every thread so the barrier is uniform; the decode is
+    // thread-0 only — concurrent calls race the registry state.
+    if (k9_res_moe_is_managed(src0)) {
+        if (params->ith == 0) {
+            k9_res_moe_ensure(src0, ids);
+        }
+        ggml_barrier(params->threadpool);
+    }
 
     const enum ggml_type type = src0->type;
 

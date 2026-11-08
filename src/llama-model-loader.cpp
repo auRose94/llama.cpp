@@ -1612,7 +1612,12 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch_in, llama_mlocks * mlock_mmaps) {
+    // v3 M3 (docs/13 §2.6): resident mode skips the whole-file prefetch —
+    // the region is NORESERVE and blob pages re-fault per decode, so a
+    // load-time WILLNEED of the full GGUF would set peak RSS to the whole
+    // file and defeat the budget.
+    const bool prefetch = prefetch_in && !k9_residency::active();
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1631,7 +1636,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 }
             }
 
-            const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
+            const size_t prefetch_size = (prefetch && use_mmap) ? (size_t) -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
                     lazy.for_file(idx));
@@ -1899,14 +1904,15 @@ bool llama_model_loader::load_all_data(
                 k9_max = std::max(k9_max, nb);
             }
         }
-        // v3 M2.5: the budget-sized arena must exist before any K9 tensor
+        // v3 M2.5/M3: the NORESERVE region must exist before any K9 tensor
         // is homed (and before the scheduler's first reserve).
         if (k9_residency::active()) {
-            k9_residency::get().prepare_arena(k9_total, k9_max);
+            k9_residency::get().prepare_region(k9_total);
         }
     }
     ggml_backend_buffer_t k9_buf = nullptr;
     size_t k9_used = 0;
+    size_t k9_off = 0; // M3: fixed-offset cursor into the residency region
 
     for (struct ggml_tensor * cur : tensors) {
         const auto * weight = get_weight(ggml_get_name(cur));
@@ -1948,25 +1954,32 @@ bool llama_model_loader::load_all_data(
                     auto & mmap_used = mmaps_used[weight->idx];
                     mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                     mmap_used.second = std::max(mmap_used.second, weight->offs + blob_len);
-                    // M2.5: dummy-home into the BUDGET arena (all tensors
-                    // overlap at the zeroed poison slab) so the scheduler
-                    // never re-homes them into its transient compute
-                    // buffers; ensure_graph re-points data into real slots
-                    // per token and LRU-evicts by freeing them.
+                    // M3: fixed home in the NORESERVE region (virtual cost
+                    // only). MoE expert tensors (ne[2] > 1) are hook-managed
+                    // at mul_mat_id; everything else fills wholly at first
+                    // graph use.
                     bool in_arena = true;
                     if (cur->data == nullptr) {
-                        in_arena = k9_residency::get().home_dummy(cur);
+                        k9_off = (k9_off + 63) & ~(size_t) 63;
+                        in_arena = k9_residency::get().home_fixed(cur, k9_off);
                     } else {
-                        in_arena = false; // homed elsewhere — external
+                        in_arena = false; // homed elsewhere — eager fallback below
+                    }
+                    if (in_arena) {
+                        k9_off += n_size;
                     }
                     const int64_t f_ne[2] = { (int64_t) cur->ne[0],
                         (int64_t) cur->ne[1] * (cur->ne[2] * cur->ne[3]) };
-                    k9_residency::get().register_tensor(ggml_get_name(cur),
-                            (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs,
-                            blob_len, it->second, f_ne,
-                            cur->type, cur, n_size, in_arena);
-                    size_done += n_size;
-                    continue;
+                    if (in_arena) {
+                        k9_residency::get().register_tensor(ggml_get_name(cur),
+                                (const uint8_t *) mappings.at(weight->idx)->addr() + weight->offs,
+                                blob_len, it->second, f_ne,
+                                cur->type, cur, n_size, k9_off - n_size,
+                                in_arena, cur->ne[2] > 1);
+                        size_done += n_size;
+                        continue;
+                    }
+                    // else: fall through to the eager path below
                 }
             }
             const size_t blob_len = ggml_nbytes(weight->tensor);
