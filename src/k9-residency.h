@@ -67,6 +67,10 @@ public:
     // M3 hook: called from ggml-cpu's mul_mat_id (thread 0).
     bool moe_ensure(const struct ggml_tensor * weights, const struct ggml_tensor * ids);
 
+    // M3 hook, HIP flavor: ids already copied to host by the caller.
+    void moe_ensure_ids(const struct ggml_tensor * weights,
+                        const int32_t * idata, int64_t n_used, int64_t n_tok);
+
     // registry membership check for the C managed-check (no decode)
     bool is_managed(std::string_view name) const {
         auto it = by_name.find(name);
@@ -87,6 +91,7 @@ private:
         size_t          region_off = 0;     // fixed home in the region
         bool            in_arena = true;    // false = externally homed
         bool            moe     = false;    // rank-3 expert tensor → hook-managed
+        uint32_t        n_exp   = 0;        // experts along the outer axis (moe)
         size_t          rows    = 0;        // stored rows (f_ne[1])
         uint32_t        lanes   = 1;        // page count
         uint32_t        rows_per = 0;       // stored rows per page

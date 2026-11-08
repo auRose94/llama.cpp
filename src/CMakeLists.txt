@@ -78,3 +78,9 @@ if (BUILD_SHARED_LIBS)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
     target_compile_definitions(llama PUBLIC  LLAMA_SHARED)
 endif()
+
+# K9 M3-HIP (docs/13 §2.6): the residency region registers with HIP and
+# wraps itself in a HIP buffer type (k9_res_hip_* in ggml-cuda.cu)
+if (GGML_HIP)
+    target_compile_definitions(llama PRIVATE K9_RES_HIP)
+endif()

@@ -12,6 +12,9 @@
 
 #include <sys/mman.h>
 
+// HIP API calls live behind the C hooks in ggml-cuda.cu (k9_res_hip_*); this
+// TU stays HIP-header-free (libllama has no ROCm include path)
+
 #include "ggml-backend.h"
 #include "k9-moe-hook.h"
 #include "llama-impl.h"
@@ -122,9 +125,26 @@ void k9_residency::prepare_region(size_t total) {
             "k9 residency: failed to map the %.2f GiB NORESERVE region",
             total / 1073741824.0));
     }
+#ifdef K9_RES_HIP
+    // M3-HIP: register the mapping so HIP kernels can fault the pages
+    // (HMM on APUs — probe in docs/13 §2.6). The buffer wraps the region
+    // with the HIP buffer type so the scheduler routes K9-tensor ops to
+    // the GPU; kernels dereference the host pointers directly.
+    if (k9_res_hip_register(region, total)) {
+        buf = k9_res_hip_region_buffer(region, total, k9_res_hip_primary_device());
+        if (buf) {
+            ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE, HIP-registered)%s\n",
+                           total / 1073741824.0,
+                           budget ? format(", expert-page budget %.2f GiB", budget / 1073741824.0).c_str() : "");
+            return;
+        }
+        k9_res_hip_unregister(region); // buffer wrap failed — plain CPU path
+    }
+#endif
     buf = ggml_backend_cpu_buffer_from_ptr(region, total);
     ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
-    LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE)%s\n",
+    LLAMA_LOG_WARN("k9 residency: region %.2f GiB mapped (NORESERVE, CPU buffer)%s\n",
                    total / 1073741824.0,
                    budget ? format(", expert-page budget %.2f GiB", budget / 1073741824.0).c_str() : "");
 }
@@ -159,6 +179,7 @@ void k9_residency::register_tensor(const std::string & name,
     e.region_off = region_off;
     e.in_arena = in_arena;
     e.moe = moe && in_arena; // external MoE tensors decode eagerly in the loader
+    e.n_exp = (uint32_t)(e.moe ? cur->ne[2] : 0);
     e.lanes = meta.lanes ? meta.lanes : 1;
     e.rows = (size_t) f_ne[1];
     e.row_bytes = e.rows ? nbytes / e.rows : 0;
@@ -233,6 +254,23 @@ bool k9_residency::moe_ensure(const struct ggml_tensor * weights, const struct g
     if (it == by_name.end() || !it->second.in_arena || !it->second.moe) {
         return false;
     }
+    if (ids->type != GGML_TYPE_I32 || ids->data == nullptr) {
+        return false;
+    }
+    moe_ensure_ids(weights, (const int32_t *) ids->data, ids->ne[0], ids->ne[1]);
+    return true;
+}
+
+void k9_residency::moe_ensure_ids(const struct ggml_tensor * weights,
+                                  const int32_t * idata, int64_t n_used, int64_t n_tok) {
+    const char * nm = ggml_get_name(weights);
+    if (!nm || !nm[0] || !idata) {
+        return;
+    }
+    auto it = by_name.find(std::string_view(nm));
+    if (it == by_name.end() || !it->second.in_arena || !it->second.moe) {
+        return;
+    }
     entry & e = it->second;
     if (env_flag("K9_RESIDENT_DEBUG")) {
         uint32_t bits = 0;
@@ -244,13 +282,7 @@ bool k9_residency::moe_ensure(const struct ggml_tensor * weights, const struct g
                        moe_decoded / 1048576.0);
     }
 
-    const int32_t * idata = (const int32_t *) ids->data;
-    if (idata == nullptr || ids->type != GGML_TYPE_I32) {
-        return false;
-    }
-    const int64_t n_used = ids->ne[0];
-    const int64_t n_tok  = ids->ne[1];
-    const uint32_t n_exp = (uint32_t) weights->ne[2];
+    const uint32_t n_exp = e.n_exp;
     if (n_exp == 0 || e.rows % n_exp != 0) {
         throw std::runtime_error(format(
             "k9 residency: MoE tensor %s rows (%zu) not divisible by experts (%u)",
@@ -383,7 +415,6 @@ bool k9_residency::moe_ensure(const struct ggml_tensor * weights, const struct g
             k9_madvise_drop((uint8_t *) e.blob + off, len, false);
         }
     }
-    return true;
 }
 
 void k9_residency::ensure_graph(const struct ggml_cgraph * gf) {
@@ -485,6 +516,24 @@ bool k9_res_moe_ensure(const struct ggml_tensor * weights, const struct ggml_ten
         LLAMA_LOG_ERROR("k9 residency: moe_ensure failed: %s\n", e.what());
     } catch (...) {
         LLAMA_LOG_ERROR("k9 residency: moe_ensure failed (unknown exception)\n");
+    }
+    abort();
+}
+
+// C hook, HIP flavor (ggml-cuda.cu's mul_mat_id): ids already copied to
+// host after the stream sync. Same no-exceptions contract.
+void k9_res_moe_ensure_ids(const struct ggml_tensor * weights, const int32_t * ids, int64_t n_used, int64_t n_tok) {
+    if (!k9_residency::active()) {
+        LLAMA_LOG_ERROR("k9 residency: HIP moe hook fired with K9_RESIDENT off\n");
+        abort();
+    }
+    try {
+        k9_residency::get().moe_ensure_ids(weights, ids, n_used, n_tok);
+        return;
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure_ids failed: %s\n", e.what());
+    } catch (...) {
+        LLAMA_LOG_ERROR("k9 residency: moe_ensure_ids failed (unknown exception)\n");
     }
     abort();
 }

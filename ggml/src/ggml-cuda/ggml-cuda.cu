@@ -1,6 +1,7 @@
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
+#include "k9-moe-hook.h"
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -978,6 +979,68 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
 };
+
+// K9 M3 (docs/13 §2.6): region buffer over a REGISTERED host mapping —
+// HIP kernels dereference the host pointers directly through HMM on APUs
+// (probe: GPU read of far untouched pages of a NORESERVE mmap succeeded).
+// The region's memory stays owned by the k9 residency registry; this
+// buffer exists so the scheduler routes K9-tensor ops to the GPU.
+struct ggml_backend_k9_region_buffer_context {
+    void * ptr;
+};
+
+static void ggml_backend_k9_region_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    // region owned by the k9 residency registry (munmap on reset)
+    GGML_UNUSED(buffer);
+}
+
+static void * ggml_backend_k9_region_buffer_get_base(ggml_backend_buffer_t buffer) {
+    auto * ctx = (ggml_backend_k9_region_buffer_context *) buffer->context;
+    return ctx->ptr;
+}
+
+static const ggml_backend_buffer_i ggml_backend_k9_region_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_k9_region_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_k9_region_buffer_get_base,
+    /* .init_tensor     = */ NULL,
+    /* .memset_tensor   = */ NULL,
+    /* .set_tensor      = */ NULL,
+    /* .get_tensor      = */ NULL,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ NULL,
+    /* .reset           = */ NULL,
+};
+
+bool k9_res_hip_register(void * ptr, size_t size) {
+    hipError_t err = hipHostRegister(ptr, size, hipHostRegisterDefault);
+    if (err != hipSuccess) {
+        GGML_LOG_WARN("k9 residency: hipHostRegister failed: %s — falling back to the CPU buffer path\n",
+                      hipGetErrorString(err));
+        (void) hipGetLastError();
+        return false;
+    }
+    return true;
+}
+
+void k9_res_hip_unregister(void * ptr) {
+    (void) hipHostUnregister(ptr);
+    (void) hipGetLastError();
+}
+
+int k9_res_hip_primary_device() {
+    return 0; // single-GPU A9; multi-GPU deferred
+}
+
+ggml_backend_buffer_t k9_res_hip_region_buffer(void * host_ptr, size_t size, int device) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+    if (buft == nullptr) {
+        return nullptr;
+    }
+    auto * ctx = new ggml_backend_k9_region_buffer_context{host_ptr};
+    return ggml_backend_buffer_init(buft, ggml_backend_k9_region_buffer_interface, ctx, size);
+}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
@@ -2111,6 +2174,20 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    // K9 (fork): M3 — decode the selected experts' pages before the kernel.
+    // The ids are written by earlier kernels on the stream: sync, copy them
+    // out, decode on the host (into the registered region — kernels read it
+    // via HMM), then launch (docs/13 §2.6). The per-layer sync stalls the
+    // pipeline; the host decode dominates batch-1 pacing anyway.
+    if (k9_res_moe_is_managed(src0)) {
+        CUDA_CHECK(hipDeviceSynchronize());
+        const int64_t k9_n_used = ids->ne[0];
+        const int64_t k9_n_tok  = ids->ne[1];
+        std::vector<int32_t> k9_ids((size_t)(k9_n_used * k9_n_tok));
+        CUDA_CHECK(hipMemcpy(k9_ids.data(), ids->data, k9_ids.size() * sizeof(int32_t), hipMemcpyDeviceToHost));
+        k9_res_moe_ensure_ids(src0, k9_ids.data(), k9_n_used, k9_n_tok);
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -2788,6 +2865,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 use_cuda_graph = false;
                 if (ggml_cuda_graph_debug_enabled()) {
                     GGML_LOG_DEBUG("%s: disabling CUDA graphs due to unsupported node type\n", __func__);
+                }
+            }
+            // K9 (fork): the paged-MoE hook decodes at enqueue time — graph
+            // replays would skip it and run with stale expert pages
+            // (docs/13 §2.6)
+            if (k9_res_moe_is_managed(node->src[0])) {
+                use_cuda_graph = false;
+                if (ggml_cuda_graph_debug_enabled()) {
+                    GGML_LOG_DEBUG("%s: disabling CUDA graphs due to K9 paged MoE tensor\n", __func__);
                 }
             }
         }
