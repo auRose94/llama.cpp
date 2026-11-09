@@ -2825,7 +2825,7 @@ ggml_status llama_context::graph_compute(
     // forces the weights to cross as split inputs, so the copy callback
     // (llama_context::sched_copy_experts) decodes and uploads the right
     // bytes on every execution, in every topology.
-    if (k9_residency::get().active()) {
+    if (k9_residency::get().active() || getenv("K9_PIN")) {
         ggml_backend_buffer_t k9_region_buf = k9_residency::get().region_buffer();
         ggml_backend_t k9_cpu = backend_cpu;
         if (k9_region_buf != nullptr && k9_cpu != nullptr) {

@@ -1640,7 +1640,7 @@ static void ggml_compute_forward_mul_mat_id(
             if (getenv("K9_RESIDENT_DEBUG")) {
                 static int k9_id_dbg = 0;
                 k9_id_dbg++;
-                if (k9_id_dbg >= 48 && k9_id_dbg <= 58) {
+                if (k9_id_dbg >= 97 && k9_id_dbg <= 105) {
                     {
                         const int32_t * k9_idv = (const int32_t *) ids->data;
                         fprintf(stderr, "k9 debug: post-decode region %s e0=%d reg_fnv=%llx src1=%p nb=%lld,%lld ne=%lld,%lld\n",

@@ -1902,6 +1902,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            // k9 debug: K9_TAP_LAST=1 -> hash+print the LAST node of every
+            // split (split-last nodes are LIVE at split end — no recycling
+            // ambiguity). Backend-aware reads.
+            if (getenv("K9_TAP_LAST")) {
+                static int k9_ln = 0;
+                k9_ln++;
+                if (ggml_graph_n_nodes(&split->graph) > 0) {
+                    ggml_tensor * k9_t = ggml_graph_node(&split->graph, ggml_graph_n_nodes(&split->graph) - 1);
+                    const size_t k9_nb = std::min<size_t>(ggml_nbytes(k9_t), 32768);
+                    std::vector<uint8_t> k9_buf(k9_nb);
+                    ggml_backend_synchronize(split_backend);
+                    if (ggml_backend_buffer_is_host(k9_t->buffer)) {
+                        memcpy(k9_buf.data(), k9_t->data, k9_nb);
+                    } else {
+                        ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
+                    }
+                    unsigned long long k9_h = 1469598103934665603ull;
+                    float k9_m = 0;
+                    for (size_t k9_b2 = 0; k9_b2 < k9_nb; k9_b2++) {
+                        k9_h = (k9_h ^ k9_buf[k9_b2]) * 1099511628211ull;
+                    }
+                    const float * k9_f = (const float *) k9_buf.data();
+                    for (size_t s = 0; s*4+3 < k9_nb && s < 4096; s++) k9_m = std::max(k9_m, fabsf(k9_f[s]));
+                    GGML_LOG_ERROR("k9 last: #%d S%d[%s] %s (%.1f KB) fnv=%llx |max|=%.4e f0=%.4e\n",
+                                   k9_ln, split_id, ggml_backend_name(split_backend), k9_t->name, k9_nb/1024.0,
+                                   k9_h, k9_m, k9_nb >= 4 ? k9_f[0] : 0.f);
+                }
+            }
+
             // k9 debug: tap per-split outputs by name (K9_TAP=comma-separated
             // substrings; each filter taps the LAST matching node of this split)
             if (getenv("K9_TAP")) {
@@ -1929,7 +1958,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     for (auto & k9_c : k9_fn) {
                                         if (!isalnum((unsigned char) k9_c)) k9_c = '_';
                                     }
-                                    FILE * k9_fp = fopen((std::string("/tmp/k9tap2/") + k9_fn + ".f32").c_str(), "wb");
+                                    FILE * k9_fp = fopen((std::string("/mnt/Matrix/Work/base9-quantization/probes/k9tap/") + k9_fn + ".f32").c_str(), "wb");
                                     if (k9_fp) {
                                         fwrite(k9_buf.data(), 1, k9_nb, k9_fp);
                                         fclose(k9_fp);
@@ -1953,8 +1982,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     for (auto & k9_c : k9_fn) {
                                         if (!isalnum((unsigned char) k9_c)) k9_c = '_';
                                     }
-                                    const std::string k9_dir = "/tmp/k9tap2";
-                                    static bool k9_dir_ok = [] { return system("mkdir -p /tmp/k9tap2") == 0; }();
+                                    const std::string k9_dir = "/mnt/Matrix/Work/base9-quantization/probes/k9tap";
+                                    static bool k9_dir_ok = [] { return system("mkdir -p /mnt/Matrix/Work/base9-quantization/probes/k9tap") == 0; }();
                                     GGML_UNUSED(k9_dir_ok);
                                     FILE * k9_fp = fopen((k9_dir + "/" + k9_fn + ".f32").c_str(), k9_tap_n <= 64 ? "wb" : "ab");
                                     if (k9_fp) {
