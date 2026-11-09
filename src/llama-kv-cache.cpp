@@ -1767,10 +1767,29 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         /*.n_tps            =*/ n_tps,
     };
 
+    if (getenv("K9_RESIDENT_DEBUG")) {
+        static int k9_mask_dbg = 0;
+        k9_mask_dbg++;
+        if (k9_mask_dbg <= 3 || k9_mask_dbg % 50 == 0) {
+            LLAMA_LOG_ERROR("k9 debug: set_input_kq_mask #%d n_tokens=%lld n_kv=%lld dst=%p buf=%s is_host=%d\n",
+                            k9_mask_dbg, (long long) n_tokens, (long long) n_kv,
+                            (void *) dst->data, ggml_backend_buffer_name(dst->buffer),
+                            (int) ggml_backend_buffer_is_host(dst->buffer));
+        }
+    }
     if (dst->type == GGML_TYPE_F16) {
         set_input_kq_mask_impl<ggml_fp16_t>(args, (ggml_fp16_t *) dst->data, causal_attn);
     } else {
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
+    }
+    if (getenv("K9_RESIDENT_DEBUG")) {
+        static int k9_mask_dbg2 = 0;
+        k9_mask_dbg2++;
+        if (k9_mask_dbg2 <= 2) {
+            const float * k9_m = (const float *) dst->data;
+            LLAMA_LOG_ERROR("k9 debug: post-fill mask[0..3]=%.1f %.1f %.1f %.1f (data=%p)\n",
+                            k9_m[0], k9_m[1], k9_m[2], k9_m[3], (void *) dst->data);
+        }
     }
 
     //const int64_t t_end = ggml_time_us();

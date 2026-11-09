@@ -7813,6 +7813,14 @@ struct ggml_tensor * ggml_graph_node(struct ggml_cgraph * cgraph, int i) {
     return cgraph->nodes[i];
 }
 
+int ggml_graph_n_leafs(struct ggml_cgraph * cgraph) {
+    return cgraph->n_leafs;
+}
+
+struct ggml_tensor * ggml_graph_leaf(struct ggml_cgraph * cgraph, int i) {
+    return cgraph->leafs[i];
+}
+
 struct ggml_tensor ** ggml_graph_nodes(struct ggml_cgraph * cgraph) {
     return cgraph->nodes;
 }

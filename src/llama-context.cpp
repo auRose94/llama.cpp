@@ -2858,6 +2858,50 @@ ggml_status llama_context::graph_compute(
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
     }
 
+    // k9 debug (K9_TAP): dump named graph INPUTS after the first execution
+    // (their buffers hold the last-filled values; first capture = prompt
+    // prefill = deterministic and identical-state for eager/resident A/B)
+    if (getenv("K9_TAP")) {
+        static int k9_tap_exec = 0;
+        k9_tap_exec++;
+        if (k9_tap_exec >= 3) { // skip warmup/fit graphs; overwrite per execution -> files = last decode step
+            synchronize();
+            static const std::string k9_filters = getenv("K9_TAP");
+            size_t k9_start = 0;
+            while (k9_start <= k9_filters.size()) {
+                const size_t k9_comma = k9_filters.find(',', k9_start);
+                const std::string k9_f = k9_filters.substr(k9_start,
+                        k9_comma == std::string::npos ? std::string::npos : k9_comma - k9_start);
+                if (!k9_f.empty()) {
+                    const int k9_nl = ggml_graph_n_leafs(gf);
+                    for (int k9_i = 0; k9_i < k9_nl; k9_i++) {
+                        ggml_tensor * k9_t = ggml_graph_leaf(gf, k9_i);
+                        if (k9_t && k9_t->name && strstr(k9_t->name, k9_f.c_str())) {
+                            const size_t k9_nb = ggml_nbytes(k9_t);
+                            std::vector<uint8_t> k9_buf(k9_nb);
+                            ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
+                            std::string k9_fn = k9_t->name;
+                            for (auto & k9_c : k9_fn) {
+                                if (!isalnum((unsigned char) k9_c)) k9_c = '_';
+                            }
+                            FILE * k9_fp = fopen(("/mnt/Matrix/Work/base9-quantization/probes/k9tap/" + k9_fn + ".f32").c_str(), "wb");
+                            if (k9_fp) {
+                                fwrite(k9_buf.data(), 1, k9_nb, k9_fp);
+                                fclose(k9_fp);
+                            }
+                            LLAMA_LOG_ERROR("k9 tap: dumped input %s (%.1f KB)\n", k9_t->name, k9_nb/1024.0);
+                            break;
+                        }
+                    }
+                }
+                if (k9_comma == std::string::npos) {
+                    break;
+                }
+                k9_start = k9_comma + 1;
+            }
+        }
+    }
+
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;

@@ -1914,6 +1914,31 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const std::string k9_f = k9_filters.substr(k9_start,
                             k9_comma == std::string::npos ? std::string::npos : k9_comma - k9_start);
                     if (!k9_f.empty()) {
+                        // scan leafs first (named inputs persist; nodes may be
+                        // recycled mid-split), then nodes from the end
+                        for (int k9_i = ggml_graph_n_leafs(&split->graph) - 1; k9_i >= 0; k9_i--) {
+                            ggml_tensor * k9_t = ggml_graph_leaf(&split->graph, k9_i);
+                            if (k9_t && k9_t->name && strstr(k9_t->name, k9_f.c_str())) {
+                                if (k9_tap_n < 400) {
+                                    k9_tap_n++;
+                                    const size_t k9_nb = ggml_nbytes(k9_t);
+                                    std::vector<uint8_t> k9_buf(k9_nb);
+                                    ggml_backend_synchronize(split_backend);
+                                    ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
+                                    std::string k9_fn = k9_t->name;
+                                    for (auto & k9_c : k9_fn) {
+                                        if (!isalnum((unsigned char) k9_c)) k9_c = '_';
+                                    }
+                                    FILE * k9_fp = fopen((std::string("/tmp/k9tap2/") + k9_fn + ".f32").c_str(), "wb");
+                                    if (k9_fp) {
+                                        fwrite(k9_buf.data(), 1, k9_nb, k9_fp);
+                                        fclose(k9_fp);
+                                    }
+                                    GGML_LOG_ERROR("k9 tap: dumped leaf %s (%.1f KB)\n", k9_t->name, k9_nb/1024.0);
+                                }
+                                break;
+                            }
+                        }
                         for (int k9_i = ggml_graph_n_nodes(&split->graph) - 1; k9_i >= 0; k9_i--) {
                             ggml_tensor * k9_t = ggml_graph_node(&split->graph, k9_i);
                             if (k9_t && k9_t->name && strstr(k9_t->name, k9_f.c_str())) {

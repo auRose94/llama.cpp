@@ -2943,6 +2943,8 @@ extern "C" {
 
     GGML_API int                   ggml_graph_size   (struct ggml_cgraph * cgraph);
     GGML_API struct ggml_tensor *  ggml_graph_node   (struct ggml_cgraph * cgraph, int i); // if i < 0, returns nodes[n_nodes + i]
+    GGML_API int                   ggml_graph_n_leafs(struct ggml_cgraph * cgraph);
+    GGML_API struct ggml_tensor *  ggml_graph_leaf   (struct ggml_cgraph * cgraph, int i);
     GGML_API struct ggml_tensor ** ggml_graph_nodes  (struct ggml_cgraph * cgraph);
     GGML_API int                   ggml_graph_n_nodes(struct ggml_cgraph * cgraph);
 
