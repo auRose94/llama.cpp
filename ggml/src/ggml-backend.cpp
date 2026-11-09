@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <string>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -1901,28 +1902,51 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
-            // k9 debug: tap per-split outputs by name (K9_TAP=substring)
+            // k9 debug: tap per-split outputs by name (K9_TAP=comma-separated
+            // substrings; each filter taps the LAST matching node of this split)
             if (getenv("K9_TAP")) {
-                static const char * k9_filter = getenv("K9_TAP");
+                static const char * k9_filters_env = getenv("K9_TAP");
+                static const std::string k9_filters = k9_filters_env ? k9_filters_env : "";
                 static int k9_tap_n = 0;
-                for (int k9_i = ggml_graph_n_nodes(&split->graph) - 1; k9_i >= 0; k9_i--) {
-                    ggml_tensor * k9_t = ggml_graph_node(&split->graph, k9_i);
-                    if (k9_t && k9_t->name && strstr(k9_t->name, k9_filter)) {
-                        if (k9_tap_n < 40) {
-                            k9_tap_n++;
-                            static std::vector<uint8_t> k9_buf;
-                            const size_t k9_nb = ggml_nbytes(k9_t);
-                            if (k9_buf.size() < k9_nb) k9_buf.resize(k9_nb);
-                            ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
-                            unsigned long long k9_h = 1469598103934665603ull;
-                            for (size_t k9_b = 0; k9_b < k9_nb && k9_b < 32768; k9_b++) {
-                                k9_h = (k9_h ^ k9_buf[k9_b]) * 1099511628211ull;
+                size_t k9_start = 0;
+                while (k9_start <= k9_filters.size() && k9_tap_n < 400) {
+                    const size_t k9_comma = k9_filters.find(',', k9_start);
+                    const std::string k9_f = k9_filters.substr(k9_start,
+                            k9_comma == std::string::npos ? std::string::npos : k9_comma - k9_start);
+                    if (!k9_f.empty()) {
+                        for (int k9_i = ggml_graph_n_nodes(&split->graph) - 1; k9_i >= 0; k9_i--) {
+                            ggml_tensor * k9_t = ggml_graph_node(&split->graph, k9_i);
+                            if (k9_t && k9_t->name && strstr(k9_t->name, k9_f.c_str())) {
+                                if (k9_tap_n < 400) {
+                                    k9_tap_n++;
+                                    const size_t k9_nb = ggml_nbytes(k9_t);
+                                    std::vector<uint8_t> k9_buf(k9_nb); // fresh: no stale-byte aliasing
+                                    ggml_backend_synchronize(split_backend);
+                                    ggml_backend_tensor_get(k9_t, k9_buf.data(), 0, k9_nb);
+                                    // dump raw tensor to /tmp/k9tap/<sanitized-name>.f32
+                                    std::string k9_fn = k9_t->name;
+                                    for (auto & k9_c : k9_fn) {
+                                        if (!isalnum((unsigned char) k9_c)) k9_c = '_';
+                                    }
+                                    const std::string k9_dir = "/tmp/k9tap2";
+                                    static bool k9_dir_ok = [] { return system("mkdir -p /tmp/k9tap2") == 0; }();
+                                    GGML_UNUSED(k9_dir_ok);
+                                    FILE * k9_fp = fopen((k9_dir + "/" + k9_fn + ".f32").c_str(), k9_tap_n <= 64 ? "wb" : "ab");
+                                    if (k9_fp) {
+                                        fwrite(k9_buf.data(), 1, k9_nb, k9_fp);
+                                        fclose(k9_fp);
+                                    }
+                                    GGML_LOG_ERROR("k9 tap: dumped %s (%.1f KB) -> /tmp/k9tap/%s.f32\n",
+                                                   k9_t->name, k9_nb/1024.0, k9_fn.c_str());
+                                }
+                                break;
                             }
-                            GGML_LOG_ERROR("k9 tap: %s [%s] fnv=%llx (%.1f KB)\n",
-                                           k9_t->name, ggml_backend_name(split_backend), k9_h, k9_nb/1024.0);
                         }
+                    }
+                    if (k9_comma == std::string::npos) {
                         break;
                     }
+                    k9_start = k9_comma + 1;
                 }
             }
         } else {

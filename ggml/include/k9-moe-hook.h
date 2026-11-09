@@ -53,6 +53,12 @@ int k9_res_hip_primary_device(void);
 ggml_backend_buffer_t k9_res_hip_region_buffer(void * host_ptr, size_t size, int device);
 
 
+// Managed check that tolerates scheduler copy-name decorations
+// ("ROCm0#blk.0.ffn_gate_exps.weight#0"). The decorated copies hide the K9
+// identity from the plain name lookup, which wrongly re-enables fusion for
+// paged weights (docs/13 §2.6).
+bool k9_res_moe_is_managed_loose(const char * name);
+
 // True when K9 residency is active (K9_RESIDENT=1 and a region is mapped).
 // Graph-capture decisions must consult this: replayed graphs skip the
 // host-side decode hooks.

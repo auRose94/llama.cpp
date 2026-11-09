@@ -1616,13 +1616,31 @@ static void ggml_compute_forward_mul_mat_id(
         }
     }
     k9_prev_dst = dst;
+    {
+        static int k9_c_mmid_calls = 0;
+        k9_c_mmid_calls++;
+        if (params->ith == 0 && (k9_c_mmid_calls <= 5 || k9_c_mmid_calls % 1000 == 0 || k9_c_mmid_calls == 49 || k9_c_mmid_calls == 97)) {
+            fprintf(stderr, "k9 debug: CPU mul_mat_id call #%d (%s) ntok=%lld\n",
+                    k9_c_mmid_calls, src0->name, (long long) ids->ne[1]);
+        }
+    }
+    if (getenv("K9_RESIDENT_DEBUG") && params->ith == 0 && strcmp(src0->name, "") != 0) {
+        static int k9_any_dbg = 0;
+        k9_any_dbg++;
+        if (k9_any_dbg >= 44 && k9_any_dbg <= 100) {
+            const int32_t * k9_idv = (const int32_t *) ids->data;
+            fprintf(stderr, "k9 debug: cpu-mm call=%d %s ntok=%lld managed=%d ids0=%d\n",
+                    k9_any_dbg, src0->name, (long long) ids->ne[1],
+                    k9_res_moe_is_managed(src0), k9_idv[0]);
+        }
+    }
     if (k9_res_moe_is_managed(src0)) {
         if (params->ith == 0) {
             k9_res_moe_ensure(src0, ids);
             if (getenv("K9_RESIDENT_DEBUG")) {
                 static int k9_id_dbg = 0;
                 k9_id_dbg++;
-                if (k9_id_dbg >= 49 && k9_id_dbg <= 51) {
+                if (k9_id_dbg >= 48 && k9_id_dbg <= 58) {
                     {
                         const int32_t * k9_idv = (const int32_t *) ids->data;
                         fprintf(stderr, "k9 debug: post-decode region %s e0=%d reg_fnv=%llx src1=%p nb=%lld,%lld ne=%lld,%lld\n",
@@ -1638,8 +1656,8 @@ static void ggml_compute_forward_mul_mat_id(
                     for (size_t k9_b = 0; k9_b < 4096; k9_b++) {
                         k9_ha = (k9_ha ^ k9_a[k9_b]) * 1099511628211ull;
                     }
-                    fprintf(stderr, "k9 debug: cpu ids %s act_fnv=%llx: %d %d %d %d %d %d %d %d\n",
-                            src0->name, k9_ha,
+                    fprintf(stderr, "k9 debug: cpu ids call=%d %s ntok=%lld act_fnv=%llx: %d %d %d %d %d %d %d %d\n",
+                            k9_id_dbg, src0->name, (long long) ids->ne[1], k9_ha,
                             k9_id[0], k9_id[1], k9_id[2], k9_id[3],
                             k9_id[4], k9_id[5], k9_id[6], k9_id[7]);
                 }

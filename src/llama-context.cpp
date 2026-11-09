@@ -2815,32 +2815,41 @@ ggml_status llama_context::graph_compute(
         }
     }
 
-    // K9 debug (K9_RES_GPU_WEIGHTS=1): user-assign the region-homed tensors
-    // to the FIRST backend (highest prio, GPU) — reproduces the eager path's
-    // "4.cur" outcome: the scheduler then keeps the whole graph in one GPU
-    // split and the kernels read the region host pointers directly (the
-    // integrated GPU's HMM tracks anon-mmap pages via mmu-notifiers; the
-    // retired finding concerned a hipHostRegister'd region).
-    if (k9_residency::get().active() && getenv("K9_RES_GPU_WEIGHTS")) {
+    // K9 (fork): pin the region-homed tensors to the CPU backend as USER
+    // scheduler assignments. Without this, ggml pass-4 ("4.cur") hands the
+    // still-unassigned weight leafs to their consumer's backend, and on
+    // integrated GPUs the scheduler then lets the kernels read the region
+    // host pointers DIRECTLY — coherent only for load-time-static pages,
+    // incoherent for residency's per-token re-decodes (docs/13 §2.6: the
+    // direct-read design is retired for exactly this reason). The pin
+    // forces the weights to cross as split inputs, so the copy callback
+    // (llama_context::sched_copy_experts) decodes and uploads the right
+    // bytes on every execution, in every topology.
+    if (k9_residency::get().active()) {
         ggml_backend_buffer_t k9_region_buf = k9_residency::get().region_buffer();
-        ggml_backend_t k9_gpu = nullptr;
-        for (const auto & b : backends) {
-            if (ggml_backend_dev_type(ggml_backend_get_device(b.get())) != GGML_BACKEND_DEVICE_TYPE_CPU) {
-                k9_gpu = b.get();
-                break;
-            }
-        }
-        if (k9_region_buf != nullptr && k9_gpu != nullptr) {
+        ggml_backend_t k9_cpu = backend_cpu;
+        if (k9_region_buf != nullptr && k9_cpu != nullptr) {
+            static int k9_pin_dbg = 0;
+            int k9_pins = 0;
             const int n = ggml_graph_n_nodes(gf);
             for (int i = 0; i < n; i++) {
                 ggml_tensor * node = ggml_graph_node(gf, i);
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     ggml_tensor * src = node->src[j];
                     if (src != nullptr && src->buffer == k9_region_buf) {
-                        ggml_backend_sched_set_tensor_backend(sched.get(), src, k9_gpu);
+                        ggml_backend_sched_set_tensor_backend(sched.get(), src, k9_cpu);
+                        k9_pins++;
                     }
                 }
             }
+            if (k9_pin_dbg < 3) {
+                k9_pin_dbg++;
+                LLAMA_LOG_ERROR("k9 debug: pinned %d region tensors to CPU backend (nodes=%d, buf=%p)\n",
+                                k9_pins, n, (void *) k9_region_buf);
+            }
+        } else {
+            LLAMA_LOG_ERROR("k9 debug: pin skipped: region_buf=%p cpu=%p\n",
+                            (void *) k9_region_buf, (void *) k9_cpu);
         }
     }
 

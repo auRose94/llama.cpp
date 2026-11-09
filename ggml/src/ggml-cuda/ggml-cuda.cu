@@ -1829,10 +1829,12 @@ static bool ggml_cuda_should_fuse_mul_mat(const ggml_tensor * ffn_up,
     // The check must look at the WEIGHT tensors (src[0] of each mul_mat_id
     // node): the NODES have graph-label names (ffn_moe_*) that never match
     // the registry (docs/13 §2.6)
-    if (ffn_up->src[0] && k9_res_moe_is_managed(ffn_up->src[0])) {
+    if (ffn_up->src[0] && (k9_res_moe_is_managed(ffn_up->src[0]) ||
+                           k9_res_moe_is_managed_loose(ffn_up->src[0]->name))) {
         return false;
     }
-    if (ffn_gate->src[0] && k9_res_moe_is_managed(ffn_gate->src[0])) {
+    if (ffn_gate->src[0] && (k9_res_moe_is_managed(ffn_gate->src[0]) ||
+                             k9_res_moe_is_managed_loose(ffn_gate->src[0]->name))) {
         return false;
     }
     const bool has_bias = ffn_up_bias != nullptr || ffn_gate_bias != nullptr;
@@ -2204,7 +2206,14 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+static int k9_g_mmid_calls = 0;
+static int k9_g_mmid_printed = 0;
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    k9_g_mmid_calls++;
+    if (k9_g_mmid_calls <= 5 || k9_g_mmid_calls % 1000 == 0) {
+        GGML_LOG_ERROR("k9 debug: GPU mul_mat_id call #%d (%s)\n", k9_g_mmid_calls, dst->src[0]->name);
+    }
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -2220,7 +2229,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     if (getenv("K9_RESIDENT_DEBUG") && ggml_nbytes(ids) >= (int64_t) sizeof(int32_t) && ggml_is_quantized(src0->type) && src0->ne[2] > 1) {
         static int krn_dbg = 0;
         krn_dbg++;
-        if ((krn_dbg >= 3 && krn_dbg <= 14) || (krn_dbg % 91 == 1 && krn_dbg < 3640)) {
+        if (krn_dbg <= 60 || krn_dbg % 91 == 1) {
             CUDA_CHECK(hipDeviceSynchronize());
             int32_t k9_e0 = 0;
             CUDA_CHECK(hipMemcpy(&k9_e0, ids->data, sizeof(int32_t), hipMemcpyDeviceToHost));

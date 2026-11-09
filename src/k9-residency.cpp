@@ -651,6 +651,19 @@ void k9_res_moe_ensure_ids(const struct ggml_tensor * weights, const int32_t * i
     abort();
 }
 
+bool k9_res_moe_is_managed_loose(const char * name) {
+    if (!k9_residency::active() || !name || !name[0]) {
+        return false;
+    }
+    std::string nm = name;
+    const size_t p1 = nm.find('#');
+    const size_t p2 = nm.rfind('#');
+    if (p1 != std::string::npos && p2 != p1) {
+        nm = nm.substr(p1 + 1, p2 - p1 - 1);
+    }
+    return k9_residency::get().is_managed(nm);
+}
+
 bool k9_residency_is_active(void) {
     return k9_residency::active();
 }
