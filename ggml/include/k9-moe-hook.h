@@ -59,6 +59,12 @@ ggml_backend_buffer_t k9_res_hip_region_buffer(void * host_ptr, size_t size, int
 // paged weights (docs/13 §2.6).
 bool k9_res_moe_is_managed_loose(const char * name);
 
+// The residency region pointer/size (null/0 before prepare_region, or
+// when residency is off). HIP-side code uses these to pin the region once
+// (hipHostRegister) so kernel reads of decoded pages are coherent.
+void * k9_res_region_pointer(void);
+size_t k9_res_region_size(void);
+
 // True when K9 residency is active (K9_RESIDENT=1 and a region is mapped).
 // Graph-capture decisions must consult this: replayed graphs skip the
 // host-side decode hooks.

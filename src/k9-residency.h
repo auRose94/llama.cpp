@@ -86,6 +86,9 @@ public:
         return it != by_name.end() && it->second.in_arena && it->second.moe;
     }
     size_t registry_size() const { return by_name.size(); }
+    // raw region pointers (for the HIP pin path)
+    void * raw_region() const { return region; }
+    size_t raw_region_size() const { return region_size; }
     // the region's buffer (for scheduler-level checks); null before prepare_region
     ggml_backend_buffer_t region_buffer() const { return buf; }
     // k9 debug: FNV(4096) of an expert's bytes in the region (no decode)

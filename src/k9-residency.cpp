@@ -664,6 +664,20 @@ bool k9_res_moe_is_managed_loose(const char * name) {
     return k9_residency::get().is_managed(nm);
 }
 
+void * k9_res_region_pointer(void) {
+    if (!k9_residency::active()) {
+        return nullptr;
+    }
+    return k9_residency::get().region_buffer() != nullptr ? k9_residency::get().raw_region() : nullptr;
+}
+
+size_t k9_res_region_size(void) {
+    if (!k9_residency::active()) {
+        return 0;
+    }
+    return k9_residency::get().raw_region_size();
+}
+
 bool k9_residency_is_active(void) {
     return k9_residency::active();
 }

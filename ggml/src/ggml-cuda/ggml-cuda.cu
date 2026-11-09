@@ -5108,6 +5108,29 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 
     ggml_cuda_set_device(cuda_ctx->device);
 
+    // K9 (fork): pin the residency region once with hipHostRegister so
+    // kernel reads of decoded pages are COHERENT. On gfx1151, kernels
+    // reading UNREGISTERED anonymous host memory hard-fault ("Page not
+    // present") when pages are absent, and read STALE content when pages
+    // are present-but-CPU-rewritten — the source of the resident-GPU
+    // garbage (docs/13 §2.6 M3-HIP). Registered pinned memory is
+    // CPU-write-coherent for GPU reads on this platform (probes/k9tap
+    // hmm_divergence_test: all phases COHERENT on ROCm 7.2.4 / 8060S).
+    {
+        static bool k9_reg_done = false;
+        if (!k9_reg_done && k9_residency_is_active()) {
+            k9_reg_done = true;
+            void * k9_rp = k9_res_region_pointer();
+            size_t k9_rs = k9_res_region_size();
+            if (k9_rp && k9_rs) {
+                hipError_t k9_e = hipHostRegister(k9_rp, k9_rs, hipHostRegisterDefault);
+                GGML_LOG_ERROR("k9 debug: region hipHostRegister %p %.2f GiB -> %s\n",
+                               k9_rp, k9_rs / 1073741824.0,
+                               k9_e == hipSuccess ? "OK (coherent GPU reads)" : hipGetErrorString(k9_e));
+            }
+        }
+    }
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     const void * graph_key = nullptr;
