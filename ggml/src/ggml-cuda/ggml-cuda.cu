@@ -2938,6 +2938,10 @@ static bool ggml_cuda_graph_debug_enabled() {
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
     bool use_cuda_graph = true;
+    // k9 debug: per-graph capture decision trace
+    static const bool k9_gate_trace = getenv("K9_GATE_TRACE");
+    bool k9_has_mmid = false;
+    int k9_mmid_first = -1;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2945,6 +2949,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        if (k9_gate_trace && node->op == GGML_OP_MUL_MAT_ID && !k9_has_mmid) {
+            k9_has_mmid = true;
+            k9_mmid_first = i;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -2977,6 +2986,15 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
     }
 
+    if (k9_gate_trace) {
+        static int k9_gt = 0;
+        k9_gt++;
+        if (k9_gt <= 400) {
+            GGML_LOG_ERROR("k9 gate: graph #%d n_nodes=%d mmid=%s capt=%s\n",
+                           k9_gt, cgraph->n_nodes, k9_has_mmid ? "Y" : "n",
+                           use_cuda_graph ? "CAPTURED" : "direct");
+        }
+    }
     return use_cuda_graph;
 }
 

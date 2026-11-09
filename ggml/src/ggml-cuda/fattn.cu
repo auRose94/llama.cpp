@@ -770,6 +770,41 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    // k9 debug: hash Q/K/V/mask/dst at the FA boundary (env K9_FA_PROBE).
+    // Backend-aware reads: host buffers memcpy, device buffers hipMemcpy.
+    if (getenv("K9_FA_PROBE")) {
+        static int k9_fa_n = 0;
+        k9_fa_n++;
+        if (k9_fa_n <= 4 || k9_fa_n % 16 == 0 || k9_fa_n % 16 == 1) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            for (int k9_i = 0; k9_i < 5; k9_i++) {
+                const ggml_tensor * k9_t = k9_i < 4 ? dst->src[k9_i] : dst;
+                if (!k9_t || !k9_t->data) {
+                    continue;
+                }
+                const bool k9_host = ggml_backend_buffer_is_host(k9_t->buffer);
+                const size_t k9_nb = std::min<size_t>(ggml_nbytes(k9_t), 65536);
+                std::vector<uint8_t> k9_b(k9_nb);
+                if (k9_host) {
+                    memcpy(k9_b.data(), k9_t->data, k9_nb);
+                } else {
+                    CUDA_CHECK(hipMemcpy(k9_b.data(), k9_t->data, k9_nb, hipMemcpyDeviceToHost));
+                }
+                unsigned long long k9_h = 1469598103934665603ull;
+                for (size_t k9_b2 = 0; k9_b2 < k9_nb; k9_b2++) {
+                    k9_h = (k9_h ^ k9_b[k9_b2]) * 1099511628211ull;
+                }
+                const float * k9_f = (const float *) k9_b.data();
+                GGML_LOG_ERROR("k9 fa#%d %s src%d=%s fnv=%llx f0=%.4e f1=%.4e max4=%.4e\n",
+                               k9_fa_n, dst->name, k9_i, k9_t->name, k9_h,
+                               k9_nb >= 4 ? k9_f[0] : 0.f, k9_nb >= 8 ? k9_f[1] : 0.f,
+                               [&]{ float m=0; for (size_t s=0; s*4+3 < k9_nb && s < 4096; s++) m = std::max(m, fabsf(k9_f[s])); return m; }());
+                if (k9_i == 4) {
+                    GGML_LOG_ERROR("k9 fa#%d dst backend=%s\n", k9_fa_n, ggml_backend_buffer_name(k9_t->buffer));
+                }
+            }
+        }
+    }
     ggml_cuda_set_device(ctx.device);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
@@ -783,6 +818,23 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+    }
+    if (getenv("K9_FA_PROBE")) {
+        static int k9_fa_out = 0;
+        k9_fa_out++;
+        if (k9_fa_out <= 4 || k9_fa_out % 16 == 0 || k9_fa_out % 16 == 1) {
+            CUDA_CHECK(cudaStreamSynchronize(ctx.stream()));
+            const size_t k9_nb = std::min<size_t>(ggml_nbytes(dst), 65536);
+            std::vector<uint8_t> k9_b(k9_nb);
+            CUDA_CHECK(hipMemcpy(k9_b.data(), dst->data, k9_nb, hipMemcpyDeviceToHost));
+            unsigned long long k9_h = 1469598103934665603ull;
+            for (size_t k9_b2 = 0; k9_b2 < k9_nb; k9_b2++) {
+                k9_h = (k9_h ^ k9_b[k9_b2]) * 1099511628211ull;
+            }
+            const float * k9_f = (const float *) k9_b.data();
+            float k9_m = 0; for (size_t s = 0; s*4+3 < k9_nb && s < 4096; s++) k9_m = std::max(k9_m, fabsf(k9_f[s]));
+            GGML_LOG_ERROR("k9 fa-out#%d %s fnv=%llx f0=%.4e max4=%.4e\n", k9_fa_out, dst->name, k9_h, k9_f[0], k9_m);
+        }
     }
 }
 

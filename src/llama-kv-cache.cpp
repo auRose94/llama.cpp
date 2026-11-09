@@ -1463,6 +1463,22 @@ ggml_tensor * llama_kv_cache::build_input_v_rot(ggml_context * ctx) const {
     return res;
 }
 
+// k9 debug: post-fill idx values (KV SET_ROWS write-landing check)
+static void k9_dbg_idxs(const char * tag, const ggml_tensor * dst, uint32_t n) {
+    if (!getenv("K9_RESIDENT_DEBUG")) {
+        return;
+    }
+    static int k9_i_dbg = 0;
+    k9_i_dbg++;
+    if (k9_i_dbg <= 4 || k9_i_dbg % 100 == 0) {
+        const int64_t * k9_d = (const int64_t *) dst->data;
+        LLAMA_LOG_ERROR("k9 debug: %s #%d n=%u idx[0..3]=%lld %lld %lld %lld (data=%p)\n",
+                        tag, k9_i_dbg, n,
+                        k9_d[0], n > 1 ? k9_d[1] : -1, n > 2 ? k9_d[2] : -1, n > 3 ? k9_d[3] : -1,
+                        (void *) dst->data);
+    }
+}
+
 void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
     const uint32_t n_tokens = ubatch->n_tokens;
     GGML_ASSERT(n_tokens == (int64_t) sinfo.size()*sinfo.n_stream());
@@ -1477,6 +1493,7 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
     }
+    k9_dbg_idxs("k_idxs", dst, sinfo.size());
 }
 
 void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch, const slot_info & sinfo) const {
@@ -1510,6 +1527,7 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
             }
         }
     }
+    k9_dbg_idxs("v_idxs", dst, sinfo.size());
 }
 
 void llama_kv_cache::set_input_k_shift(ggml_tensor * dst) const {
